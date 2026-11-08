@@ -1,0 +1,39 @@
+{
+  "provider": "deepseek",
+  "model": "deepseek-flash",
+  "base_url": "https://api.deepseek.com",
+  "key_env": "DEEPSEEK_API_KEY",
+  "account_scope": "default",
+  "request_timeout_seconds": 30.0,
+  "schema_version": 3,
+  "protocol": "chat_completions",
+  "generation": {
+    "temperature": 0.0,
+    "extra_body": {}
+  },
+  "output": {
+    "mode": "json_object",
+    "tools": "native"
+  },
+  "usage_mapping": {
+    "input_tokens": "prompt_tokens",
+    "output_tokens": "completion_tokens",
+    "cache_hit_input_tokens": "prompt_cache_hit_tokens",
+    "cache_miss_input_tokens": "prompt_cache_miss_tokens",
+    "reasoning_tokens": "completion_tokens_details.reasoning_tokens"
+  },
+  "capabilities": {
+    "output_limit_optional": true,
+    "max_output_tokens": 393216,
+    "context_window": 1048576,
+    "thinking_format": "deepseek",
+    "can_disable_thinking": true,
+    "reasoning_levels": [
+      "low",
+      "high",
+      "max"
+    ],
+    "default_reasoning_level": "high",
+    "source": "https://api-docs.deepseek.com/api/list-models/"
+  }
+}

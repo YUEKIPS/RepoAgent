@@ -1,0 +1,4 @@
+[
+  {"kind":"plan","plan":{"queries":["README"],"kind":"path"}},
+  {"kind":"answer","answer":{"answer_status":"insufficient_evidence","answer":"这是离线工程脚本，尚未核查该问题所需的实现。","claims":[],"citations":[],"limitations":["预设响应用于界面与流程演示，不代表模型理解或语义验收。"]}}
+]

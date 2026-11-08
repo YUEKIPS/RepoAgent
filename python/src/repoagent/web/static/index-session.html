@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="ink">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="session-token" content="__SESSION_TOKEN__">
+  <title>RepoAgent · 仓库问答</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/marked.umd.js" defer></script><script src="/markdown.js" defer></script><script src="/stream.js" defer></script><script src="/inspector.js" defer></script><script src="/library.js" defer></script><script src="/app.js" defer></script>
+</head>
+<body>
+<button id="sidebar-shade" type="button" aria-label="关闭侧栏" hidden></button>
+<aside id="app-sidebar" class="sidebar" aria-label="对话与仓库池">
+  <a class="brand" href="/" aria-label="RepoAgent首页"><span class="logo">R</span><strong>RepoAgent<small>仓库理解 · 证据核查</small></strong></a>
+  <button id="close-sidebar" type="button" aria-label="关闭侧栏">✕</button>
+  <button id="new-session" class="primary" type="button">＋ 新建对话</button>
+  <div class="section-label">对话 <span id="task-count">0</span></div><nav id="task-list" aria-label="会话列表"></nav>
+  <button id="more-sessions" type="button" hidden>更多对话</button>
+  <div class="sidebar-footer">
+    <button id="sidebar-repositories" type="button">▣ 仓库池</button><button id="sidebar-settings" type="button">⚙ 运行设置</button>
+    <div class="organization-footer"><button id="show-archive" type="button">归档</button><button id="show-trash" type="button">回收站</button></div>
+    <label class="theme-control" for="theme-select">皮肤<select id="theme-select"><option value="ink">深侧栏</option><option value="blue">蓝灰 · 第一版</option><option value="slate">青灰 · 现网</option><option value="forest">森绿</option><option value="sand">暖纸</option></select></label>
+    <div class="connection"><span id="connection-badge" class="pill">连接中</span><strong id="model-name">—</strong></div>
+    <p class="sidebar-bottom"><span class="dot"></span> 固定版本 · 只读源码</p>
+  </div>
+</aside>
+<div id="sidebar-resize" role="separator" aria-label="调整侧栏宽度" aria-orientation="vertical" aria-valuemin="210" aria-valuemax="400" aria-valuenow="280" tabindex="0"></div>
+<main>
+  <header class="page-header"><button id="mobile-sidebar" type="button" aria-label="打开侧栏" aria-controls="app-sidebar" aria-expanded="false">☰</button><div><span class="eyebrow">对话</span><h1 id="session-title">选择或新建对话</h1></div><button id="open-inspector" type="button" aria-haspopup="dialog" aria-controls="task-inspector" aria-expanded="false" disabled>任务详情 ↗</button></header>
+  <div id="scope-region" class="scope-region" hidden><span id="scope-note">本对话固定仓库</span><div id="scope-chips"></div></div>
+  <div class="workspace"><section class="chat-column" aria-label="问答区">
+    <p id="notice" class="notice" role="status">正在连接本地服务…</p>
+    <div id="running-status" class="running-status" hidden><span id="running-message"></span><button id="return-running" type="button" hidden>返回运行中的对话</button></div>
+    <p id="stream-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+    <button id="older-turns" type="button" hidden>加载更早的问答</button><p id="session-context" class="context-note" role="status">新建对话时选择仓库，创建后范围固定。</p>
+    <div id="messages" class="messages" aria-label="回答记录" tabindex="0"><div id="welcome" class="welcome"><h2 id="welcome-title">从仓库池开始一次对话</h2><p id="welcome-description">准备仓库的固定读取版本，再新建对话选择分析范围。<br>回答附带代码引用，方便核查。</p><div class="welcome-actions"><button id="welcome-start" class="primary" type="button">新建对话</button><button id="welcome-add" type="button">打开仓库池</button></div><button id="example" class="example" type="button">示例：介绍仓库的主要结构和入口 ↗</button></div></div>
+    <form id="chat-form" class="composer"><label class="sr-only" for="question">你的问题</label><textarea id="question" rows="2" maxlength="4000" placeholder="提问或继续追问这些仓库…" required></textarea>
+      <details class="log-input"><summary>附加异常日志</summary><label class="sr-only" for="log-text">异常日志</label><textarea id="log-text" rows="3" maxlength="12000" placeholder="仅填写分析所需日志，避免凭据与个人信息"></textarea></details>
+      <div class="common-settings"><label for="answer-style">回答方式<select id="answer-style"><option value="auto">自动</option><option value="brief">简洁</option><option value="detailed">详解</option></select></label><label for="native-thinking">原生思考<select id="native-thinking"><option value="default">服务默认</option></select></label></div>
+      <div class="composer-footer"><button id="open-settings" type="button" aria-haspopup="dialog" aria-controls="run-settings-dialog">运行设置</button><span>Ctrl / ⌘ + Enter 发送</span><div><button id="retry" type="button" hidden>重试原提交</button><button id="cancel" type="button" hidden>停止任务</button><button id="send" class="primary" type="submit" disabled>发送 ↑</button></div></div>
+    </form><div id="error" class="error" role="alert"></div>
+  </section></div>
+</main>
+<dialog id="repository-manager" class="pool-dialog" aria-labelledby="repository-heading">
+  <div class="inspector-title"><div><h2 id="repository-heading">仓库池</h2><p class="context-note">管理固定读取版本，选仓在新建对话时完成。</p></div><button id="pool-close-icon" type="button" aria-label="关闭仓库池">✕</button></div>
+  <div class="pool-content"><div class="tabs"><button type="button" data-pool-tab="list" aria-selected="true">已有仓库</button><button type="button" data-pool-tab="add" aria-selected="false">添加仓库</button></div>
+    <div id="pool-existing"><div id="repository-list"></div></div>
+    <div id="pool-add" hidden><div class="tabs"><button type="button" aria-current="true">GitHub</button><button type="button" id="local-import-info">本地路径 · 暂不支持</button></div><p id="local-import-note" class="context-note" hidden>Web暂不支持输入本地路径导入；命令行预先登记的固定快照仍可出现在仓库池。</p>
+    <form id="repository-form"><label for="repository-url">公开 GitHub 仓库地址</label><input id="repository-url" type="url" maxlength="512" placeholder="https://github.com/owner/repository" required><label for="repository-ref">分支、标签或完整提交号（可选）</label><input id="repository-ref" maxlength="200" placeholder="留空使用默认分支"><p class="context-note">准备固定版本目录，提问时再获取所需源码。</p><button id="add-repository" class="primary" type="submit">添加到仓库池</button></form></div>
+    <p id="repository-status" role="status" aria-live="polite"></p><button id="retry-repository-job" type="button" hidden>重试原仓库任务</button><button id="cancel-repository-job" type="button" hidden>停止准备</button><p id="github-auth-status" class="context-note"></p><p id="repository-cache-status" class="context-note"></p>
+  </div><div class="dialog-actions"><button id="close-repositories" type="button">完成</button></div>
+</dialog>
+<dialog id="task-inspector" class="inspector" aria-labelledby="inspector-heading">
+  <div class="inspector-title"><div><span class="eyebrow">核查回答</span><h2 id="inspector-heading">引用与任务详情</h2></div><button id="close-inspector" type="button" aria-label="关闭任务详情" autofocus>✕</button></div>
+  <div class="inspector-content"><div id="inspector-error" class="error" role="alert"></div><div id="inspection-empty" class="inspection-empty"><p>选择一条回答，查看引用及任务记录。</p></div>
+    <div id="inspection" hidden><p id="inspection-context" class="inspection-context"></p><h3 class="panel-heading">代码引用</h3><div id="sources" class="panel"></div>
+      <details class="task-debug"><summary>调试与记录</summary><dl id="task-meta" class="task-meta"></dl>
+        <div class="tabs" role="tablist" aria-label="调试记录">
+          <button id="tab-trace" type="button" role="tab" aria-selected="true" aria-controls="trace" data-tab="trace">执行轨迹</button>
+          <button id="tab-usage" type="button" role="tab" aria-selected="false" aria-controls="usage" data-tab="usage" tabindex="-1">Token用量</button>
+          <button id="tab-raw" type="button" role="tab" aria-selected="false" aria-controls="raw" data-tab="raw" tabindex="-1">原始回答</button>
+        </div>
+        <div id="trace" class="panel" role="tabpanel" aria-labelledby="tab-trace"></div><div id="usage" class="panel" role="tabpanel" aria-labelledby="tab-usage" hidden></div><div id="raw" class="panel raw-answer" role="tabpanel" aria-labelledby="tab-raw" hidden></div>
+        <div class="export-row"><button id="export" type="button" disabled>导出完整 JSON ↓</button></div>
+      </details>
+      <p class="inspection-note">执行完成不代表结论正确，请核查引用是否支持结论。</p>
+    </div>
+  </div>
+</dialog>
+<dialog id="organization-action" class="compact-dialog" aria-label="整理内容"><button id="close-action" type="button" aria-label="关闭操作">✕</button><div id="organization-menu"></div><form id="organization-form"><div id="organization-fields" hidden><label>名称<input id="organization-title" maxlength="100" required></label></div><button id="organization-save" type="submit" hidden>保存</button></form><p id="organization-error" class="error" role="alert"></p><button id="retry-management" type="button" hidden>重试原管理操作</button></dialog>
+<dialog id="organization-library" class="pool-dialog" aria-labelledby="library-heading"><div class="inspector-title"><h2 id="library-heading">归档</h2><button id="close-library" type="button" aria-label="关闭整理列表">✕</button></div><div class="pool-content"><label>内容类型<select id="library-kind"><option value="session">对话</option><option value="repository">仓库</option></select></label><div id="library-list"></div><button id="more-library" type="button" hidden>更多记录</button></div></dialog>
+
+<dialog id="run-settings-dialog" class="settings-dialog run-settings" aria-labelledby="settings-heading">
+  <div class="inspector-title"><div><span class="eyebrow">运行设置</span><h2 id="settings-heading">按需要调整，下次提问生效</h2></div><button id="close-settings" type="button" aria-label="关闭运行设置" autofocus>✕</button></div>
+  <div class="settings-content"><p id="settings-error" class="error" role="alert"></p><div class="advanced-content"><h3>下次提问</h3><p class="context-note">这些设置仅影响下一次提交，正在运行的任务保持原参数。</p><div class="settings-grid">
+          <label>输出额度<select id="output-mode"><option value="auto">自动 · 按模型服务</option><option value="custom">自定义单次上限</option></select></label>
+          <label>通用输出上限<input id="limit-output" type="number" placeholder="自动" min="1"></label>
+          <label>规划单独覆盖<input id="limit-plan-output" type="number" placeholder="跟随通用／自动" min="1"></label>
+          <label>累计证据容量<input id="limit-evidence" type="number" required></label>
+          <label>单次输入保护上限（字节）<input id="limit-input" type="number" required></label>
+          <label>模型请求次数<input id="limit-model" type="number" required></label>
+          <label>工具动作次数<input id="limit-tools" type="number" required></label>
+          <label>任务时限（秒）<input id="limit-seconds" type="number" required></label>
+          <label>摘要后近期保留轮数<input id="limit-recent-turns" type="number" required></label>
+          <label>摘要输出上限（token）<input id="limit-summary-output" type="number" required></label>
+          <label>活动原文容量<input id="limit-active-evidence" type="number" required></label>
+          <label>冷证据目录容量<input id="limit-cold-catalog" type="number" required></label>
+          <label><input id="summary-enabled" type="checkbox" checked> 历史较长时生成摘要</label>
+          <label><input id="stream-enabled" type="checkbox" checked> 逐步显示生成正文</label>
+
+        </div>
+        <details class="settings-help"><summary>额度与计量说明</summary><p id="output-unit">每次完整请求先估算token并按模型窗口判断压力；输入保护上限与证据容量另按JSON UTF-8字节。真实用量以服务返回为准；模拟输出按JSON字节。完整输出包含正文与引用；模型次数含规划/纠正，工具次数含初始检索/读取。</p></details>
+<button id="reset-limits" type="button">恢复任务默认设置</button><section class="service-settings"><h3>服务设置 · 立即保存</h3><label><input id="auto-resume" type="checkbox"> 服务重启后自动继续可恢复任务</label><p class="context-note">仅恢复发送状态明确的任务；用量未知的请求不会自动重发。</p></section><details class="developer-settings"><summary>开发调试</summary><label for="mode">执行模式</label><select id="mode"><option value="agent">Agent · 受控工具循环</option><option value="baseline">Baseline · 单次回答</option></select><p id="budget-label">正在读取运行设置</p><button id="toggle-model-source" type="button" disabled>正在读取模型来源</button><p class="source-switch-hint">来源与模式仅影响下次提问。</p></details></div>
+      </div>
+</dialog>
+<dialog id="new-session-dialog" class="pool-dialog" aria-labelledby="new-session-heading"><div class="inspector-title"><div><h2 id="new-session-heading">新建对话</h2><p class="context-note">选择1～8个读取版本，创建后范围固定。</p></div><button id="close-new-session" type="button" aria-label="关闭新建对话">✕</button></div><div class="pool-content"><div id="new-repo-options" class="repo-pick"></div><div class="new-add-row"><button id="new-add-repository" type="button">＋ 添加新仓库到池</button><span id="new-selected-count" class="context-note"></span></div><p id="new-session-error" class="error" role="alert"></p></div><div class="dialog-actions"><button id="cancel-new-session" type="button">取消</button><button id="confirm-new-session" class="primary" type="button">创建对话</button></div></dialog>
+<div class="toast-region"><p id="toast" role="status" hidden></p><button id="dismiss-toast" type="button" aria-label="关闭操作提示">✕</button></div>
+
+</body></html>

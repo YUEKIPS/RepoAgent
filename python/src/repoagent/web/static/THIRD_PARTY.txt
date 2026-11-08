@@ -1,0 +1,10 @@
+Marked 18.1.2 — MIT license
+Homepage: https://marked.js.org/
+Source: https://github.com/markedjs/marked
+Package: https://registry.npmjs.org/marked/-/marked-18.1.2.tgz
+Package integrity (SHA-512, base64): DfOnvLAQ6WYeWxWO1u4RyFOeqyHup6dks5PPqnoFiooU7ipRvidO/2j8plhAHIiZg574E9ZlzSjUiPMLAzFkgg==
+Vendored lib/marked.umd.js SHA-256: 9eb730d2362ae1a8c6201698f17009e16671be6946d3d06503ddc0575283db7c
+License: marked-LICENSE.txt
+This distribution uses only the GFM lexer. Untrusted HTML is never passed to
+an HTML parser; markdown.js creates a fixed set of DOM nodes and safe links.
+No runtime CDN or automatic image fetching is used.
