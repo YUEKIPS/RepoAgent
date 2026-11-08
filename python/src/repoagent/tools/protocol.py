@@ -254,6 +254,8 @@ class Dispatcher:
                 "rate_limited",
                 "access_denied",
                 "connection_or_tls_failed",
+                "github_connect_timeout", "github_tls_timeout", "github_headers_timeout",
+                "github_read_timeout", "github_connection_failed", "github_incomplete_response",
                 "request_timeout",
                 "network_time_limit",
                 "network_byte_limit",

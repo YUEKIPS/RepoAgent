@@ -409,6 +409,18 @@ const narrowLayout=globalThis.matchMedia?.("(max-width:650px)");
 const foldMobileHistory=event=>{const history=document.querySelector(".history-section");if(configuration){history?.setAttribute('open','');return;}if(event.matches) history?.removeAttribute("open");else history?.setAttribute("open","");};
 if(narrowLayout) {foldMobileHistory(narrowLayout);narrowLayout.addEventListener("change",foldMobileHistory);}
 let repositoryJob=null;
+Object.assign(errors,{
+  github_connect_timeout:"连接GitHub超时，请稍后重新添加仓库。",
+  github_tls_timeout:"与GitHub建立加密连接超时，请检查网络后重新添加。",
+  github_headers_timeout:"等待GitHub响应超时，请稍后重新添加仓库。",
+  github_read_timeout:"读取GitHub数据超时，本次准备未完成，请稍后重新添加仓库。",
+  github_connection_failed:"GitHub连接中断，本次获取未完成，请检查网络。",
+  github_certificate_failed:"GitHub证书校验失败，请核对本机时间、证书及网络环境。",
+  github_tls_failed:"GitHub加密连接失败，请检查网络环境。",
+  github_incomplete_response:"GitHub响应未完整接收，请稍后重新添加仓库。",
+  dns_timeout:"解析GitHub地址超时，请检查网络。",
+  response_too_large:"GitHub返回的数据超过本次读取上限。"
+});
 Object.assign(errors,{invalid_repository_url:"请填写公开GitHub仓库首页地址，不包含文件路径、凭据或查询参数。",invalid_repository_ref:"分支或提交号格式无效。",public_visibility_not_confirmed:"无法确认这是公开仓库，未使用令牌提升访问权限。",resource_not_visible:"GitHub未返回此资源，请检查地址、版本或公开状态。",rate_limited:"GitHub请求额度受限，请稍后重试；已有缓存仍可使用。",credential_rejected:"GitHub令牌无效或已失效，请在本机更新配置后重启加载。",access_denied:"GitHub拒绝了请求，请核对公开状态与令牌权限。",repository_identity_mismatch:"仓库身份发生变化，已停止获取。",connection_or_tls_failed:"无法安全连接GitHub，请检查网络。",dns_address_rejected:"GitHub连接地址未通过检查。",redirect_requires_review:"仓库地址发生跳转，请核对当前公开地址后重新添加。",source_version_in_use:"此版本仍被会话、任务或引用使用，无法移除。",cache_full_with_protected_content:"缓存已满，现有内容受历史引用保护；无法继续获取新文件。",repository_disk_limit:"仓库存储已达到空间保护上限。",tree_identity_or_completeness_failed:"目录不完整或版本不一致，未登记此版本。",network_request_limit:"本轮仓库请求已达上限，请依据已有证据核查。",network_time_limit:"本轮仓库读取已达时间上限。",catalog_policy_limit:"仓库规模超过当前支持范围，未登记此版本。",cursor_stale:"内容覆盖已变化，请从第一页重新检索。"});
 function repositoryName(repo) {return repo.name ? `${repo.name} · ${repo.commit.slice(0,8)}${repo.text_profile ? ' · 文本配置 '+repo.source_version_id.slice(0,6) : ''}` : repo.id;}
 function renderRepositoryManager() {return LibraryUI.renderRepositories();}

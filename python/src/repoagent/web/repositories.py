@@ -230,7 +230,7 @@ class RepositoryManager:
                     revision["name"], budget, revision["repository_id"]
                 )
                 detail = self.client.get(
-                    f"/repos/{meta['full_name']}/commits/{quote(revision['ref'], safe='')}",
+                    f"/repos/{meta['full_name']}/commits?sha={quote(revision['ref'], safe='')}&per_page=1",
                     budget,
                 )
                 commit = detail.get("sha")

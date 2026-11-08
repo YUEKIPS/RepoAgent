@@ -15,6 +15,7 @@ import ssl
 import threading
 import time
 import unicodedata
+import zlib
 from dataclasses import dataclass, field
 from urllib.parse import quote, unquote, urlsplit
 
@@ -26,8 +27,10 @@ NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 
 
 class GitHubError(ValueError):
-    def __init__(self, code):
+    def __init__(self, code, *, stage=None, status=None):
         self.code = code
+        self.stage = stage
+        self.status = status
         super().__init__(code)
 
 
@@ -73,14 +76,13 @@ def validate_route(route):
             suffix = suffix.removesuffix("?recursive=1")
         if OID.fullmatch(suffix):
             return parts[5]
-    if len(parts) == 6 and parts[4] == "commits":
-        ref = unquote(parts[5])
-        if (
-            ref
-            and len(ref) <= 200
-            and quote(ref, safe="") == parts[5]
-            and not any(ord(char) < 33 or ord(char) == 127 for char in ref)
-        ):
+    if len(parts) == 5 and parts[4].startswith("commits?sha="):
+        query = parts[4].removeprefix("commits?sha=")
+        encoded = query.removesuffix("&per_page=1")
+        ref = unquote(encoded)
+        if (query.endswith("&per_page=1") and ref and len(ref) <= 200
+            and quote(ref, safe="") == encoded
+            and not any(ord(c) < 33 or ord(c) == 127 for c in ref)):
             return "commit"
     raise GitHubError("route_rejected")
 
@@ -144,29 +146,39 @@ class DirectTransport:
     """实际socket只连已核对IP，TLS仍校验GitHub主机名；不自动重定向。"""
 
     def request(self, route, headers, limit, seconds, budget):
-        deadline = time.monotonic() + min(8, seconds)
-        family, kind, proto, _, address = resolve_public(min(3, seconds))
-        connection = None
-        raw = socket.socket(family, kind, proto)
-        try:
+        deadline = time.monotonic() + seconds
+        connection = raw = secured = None
+        stage, status = "dns", None
+
+        def remaining(cap):
             budget.check()
-            raw.settimeout(max(0.001, min(3, deadline - time.monotonic())))
+            left = min(deadline - time.monotonic(), budget.remaining())
+            if left <= 0:
+                raise TimeoutError()
+            return min(cap, left)
+
+        try:
+            family, kind, proto, _, address = resolve_public(remaining(3))
+            stage = "connect"
+            raw = socket.socket(family, kind, proto)
+            raw.settimeout(remaining(3))
             raw.connect(address)
-            if raw.getpeername()[0] != address[0] or not public_address(
-                raw.getpeername()[0]
-            ):
+            if raw.getpeername()[0] != address[0] or not public_address(raw.getpeername()[0]):
                 raise GitHubError("peer_address_rejected")
-            raw.settimeout(max(0.001, deadline - time.monotonic()))
-            secured = ssl.create_default_context().wrap_socket(
-                raw, server_hostname=HOST
-            )
-            connection = http.client.HTTPSConnection(HOST, timeout=8)
+            stage = "tls"
+            raw.settimeout(remaining(8))
+            secured = ssl.create_default_context().wrap_socket(raw, server_hostname=HOST)
+            stage = "headers"
+            secured.settimeout(remaining(10))
+            connection = http.client.HTTPSConnection(HOST, timeout=10)
             connection.sock = secured
             connection.request("GET", route, headers=headers)
-            secured.settimeout(max(0.001, deadline - time.monotonic()))
+            secured.settimeout(remaining(10))
             response = connection.getresponse()
+            status = response.status
             info = {key.lower(): value for key, value in response.getheaders()}
-            if info.get("content-encoding", "identity") != "identity":
+            encoding = info.get("content-encoding", "identity")
+            if encoding != "identity" and not (encoding == "gzip" and headers.get("Accept-Encoding") == "gzip"):
                 raise GitHubError("unexpected_content_encoding")
             if "content-length" in info:
                 try:
@@ -175,13 +187,10 @@ class DirectTransport:
                     raise GitHubError("invalid_content_length") from None
                 if not 0 <= length <= limit:
                     raise GitHubError("response_too_large")
+            stage = "body"
             chunks, size = [], 0
             while True:
-                budget.check()
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise GitHubError("request_timeout")
-                secured.settimeout(remaining)
+                secured.settimeout(remaining(10))
                 chunk = response.read1(min(65536, limit + 1 - size))
                 size += len(chunk)
                 budget.bytes += len(chunk)
@@ -191,15 +200,50 @@ class DirectTransport:
                 if not chunk:
                     break
                 chunks.append(chunk)
-            return response.status, info, b"".join(chunks)
-        except GitHubError:
+            if "content-length" in info and size != length:
+                raise GitHubError("github_incomplete_response")
+            data = b"".join(chunks)
+            if encoding == "gzip":
+                try:
+                    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    decoded = decoder.decompress(data, limit + 1)
+                except zlib.error:
+                    raise GitHubError("invalid_compressed_response") from None
+                if len(decoded) > limit:
+                    raise GitHubError("response_too_large")
+                if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+                    raise GitHubError("invalid_compressed_response")
+                # Charge the larger of wire and expanded sizes; compression must
+                # not bypass the shared byte budget or decoded response cap.
+                budget.bytes += max(0, len(decoded) - size)
+                remaining(10)
+                data = decoded
+            info["_wire_bytes"] = size
+            return status, info, data
+        except GitHubError as error:
+            error.stage = error.stage or stage
+            error.status = error.status or status
             raise
+        except ssl.SSLCertVerificationError:
+            raise GitHubError("github_certificate_failed", stage=stage, status=status) from None
+        except ssl.SSLError:
+            raise GitHubError("github_tls_failed", stage=stage, status=status) from None
+        except TimeoutError:
+            code = {"dns": "dns_timeout", "connect": "github_connect_timeout",
+                    "tls": "github_tls_timeout", "headers": "github_headers_timeout",
+                    "body": "github_read_timeout"}[stage]
+            raise GitHubError(code, stage=stage, status=status) from None
+        except http.client.IncompleteRead:
+            raise GitHubError("github_incomplete_response", stage=stage, status=status) from None
         except (OSError, http.client.HTTPException, ValueError):
-            raise GitHubError("connection_or_tls_failed") from None
+            raise GitHubError("github_connection_failed", stage=stage, status=status) from None
         finally:
             if connection:
                 connection.close()
-            raw.close()
+            if secured:
+                secured.close()
+            if raw:
+                raw.close()
 
 
 class GitHubClient:
@@ -228,7 +272,7 @@ class GitHubClient:
             "Accept": "application/vnd.github.raw+json"
             if raw
             else "application/vnd.github+json",
-            "Accept-Encoding": "identity",
+            "Accept-Encoding": "gzip" if kind == "trees" else "identity",
             "User-Agent": "RepoAgent-N3-Probe",
             "X-GitHub-Api-Version": "2022-11-28",
         }
@@ -237,7 +281,7 @@ class GitHubClient:
             raise GitHubError("credential_rejected")
         if authenticated:
             headers["Authorization"] = "Bearer " + self._token
-        cap = 4 * 1024 * 1024 if kind == "trees" else 1024 * 1024
+        cap = 4 * 1024 * 1024 if kind == "trees" else (256 * 1024 if kind == "commit" else 1024 * 1024)
         cap = min(cap, budget.max_bytes - budget.bytes)
         event = {
             "kind": kind,
@@ -257,6 +301,8 @@ class GitHubClient:
                 budget,
             )
             event["status"] = status
+            if isinstance(info.get("_wire_bytes"), int):
+                event["wire_bytes"] = info["_wire_bytes"]
             # 测试传输也必须遵守实际传输的上限与取消契约。
             if len(data) > cap:
                 raise GitHubError("response_too_large")
@@ -298,11 +344,19 @@ class GitHubClient:
                 result = json.loads(data)
             except (ValueError, UnicodeError):
                 raise GitHubError("invalid_github_json") from None
+            if kind == "commit":
+                if not isinstance(result, list) or len(result) != 1:
+                    raise GitHubError("commit_identity_failed")
+                result = result[0]
             if not isinstance(result, dict):
                 raise GitHubError("invalid_github_json")
             return result
         except GitHubError as error:
             event["error"] = error.code
+            if error.stage in {"dns", "connect", "tls", "headers", "body"}:
+                event["stage"] = error.stage
+            if isinstance(error.status, int) and 100 <= error.status <= 599:
+                event["status"] = error.status
             raise
         finally:
             elapsed = time.monotonic() - start

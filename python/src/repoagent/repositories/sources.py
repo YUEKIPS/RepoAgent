@@ -62,7 +62,7 @@ class GitHubDescriptor:
     versions: dict = field(
         default_factory=lambda: {
             "source": "github-lazy-v1",
-            "policy": "n3-files-v1",
+            "policy": "mainstream-files-v1",
             **parser_versions(),
         }
     )
@@ -110,7 +110,7 @@ class GitHubSource:
                 "source": "github-lazy-v2-text"
                 if self.store.text_profile(self.version) is not None
                 else "github-lazy-v1",
-                "policy": "n3-files-v1",
+                "policy": "mainstream-files-v1",
                 **parser_versions(),
             },
         )
@@ -224,7 +224,7 @@ def prepare_github(
     if not isinstance(selected, str) or not selected or len(selected) > 200:
         raise GitHubError("invalid_repository_ref")
     detail = client.get(
-        f"/repos/{meta['full_name']}/commits/{quote(selected, safe='')}", budget
+        f"/repos/{meta['full_name']}/commits?sha={quote(selected, safe='')}&per_page=1", budget
     )
     commit, tree = (
         detail.get("sha"),

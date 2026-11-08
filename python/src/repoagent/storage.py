@@ -4,7 +4,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-DATA_VERSION = "repoagent-pool-20261108"
+DATA_VERSION = "repoagent-public-v1"
 
 
 def guard_database(path, kind):

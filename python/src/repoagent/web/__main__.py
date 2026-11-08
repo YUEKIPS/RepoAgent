@@ -16,7 +16,7 @@ from repoagent.web.service import ChatService
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", action="append", default=[], metavar="NAME=PATH")
-    parser.add_argument("--output-dir", type=Path, default=Path("work/web-v080"))
+    parser.add_argument("--output-dir", type=Path, default=Path("work/web"))
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--mock-script", type=Path)
     parser.add_argument("--model-config", type=Path)

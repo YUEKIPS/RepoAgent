@@ -5,7 +5,6 @@
 """
 
 import hashlib
-import importlib.metadata
 import json
 import os
 import re
@@ -17,8 +16,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from repoagent.snapshots.frontend import LANGUAGES, parse_frontend
-from repoagent.snapshots.java import MAX_FILE_BYTES, parse_java
+from repoagent.snapshots.languages import (
+    LANGUAGES,
+    SOURCE_EXTENSIONS,
+    TEXT_LANGUAGES,
+    language_for,
+    parse_source,
+    parser_versions,
+)
+from repoagent.snapshots.symbols import MAX_FILE_BYTES
 
 EXCLUDED_DIRS = {
     ".git",
@@ -31,9 +37,14 @@ EXCLUDED_DIRS = {
     "coverage",
     ".next",
     "vendor",
+    "obj", ".terraform", ".gradle", ".dart_tool",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", ".nox", "venv", "site-packages", ".hypothesis",
 }
-EXTENSIONS = {
+EXTENSIONS = set(LANGUAGES) | set(TEXT_LANGUAGES) | {
     ".java",
+    ".py",
+    ".pyi",
     ".xml",
     ".yml",
     ".yaml",
@@ -58,8 +69,29 @@ CONFIG_NAMES = {
     ".env.production",
     ".env.test",
     ".env.staging",
+    "pyproject.toml", "setup.cfg", "requirements.txt",
+    "tox.ini", "pytest.ini", "Pipfile",
+    "Dockerfile", "Containerfile", "Makefile", "CMakeLists.txt", "go.mod", "go.sum",
+    "Cargo.lock", "Gemfile", "Rakefile", "composer.lock",
 }
 READABLE = {"parsed", "text", "text_only"}
+
+
+def supported_file(path: str) -> bool:
+    item = PurePosixPath(path)
+    return (item.suffix.lower() in EXTENSIONS or item.name in CONFIG_NAMES
+            or item.name.startswith(("Dockerfile.", "Containerfile."))
+            or item.suffix.lower() in {".cmake", ".csproj", ".fsproj", ".props", ".targets", ".gradle"}
+            or item.name.startswith("requirements-") and item.suffix.lower() == ".txt"
+            or "requirements" in item.parts[:-1] and item.suffix.lower() == ".txt")
+
+
+def excluded_directory(path: str) -> bool:
+    parts = PurePosixPath(path).parts[:-1]
+    return bool(EXCLUDED_DIRS.intersection(parts)) or any(
+        left == "bin" and right.casefold() in {"debug", "release"}
+        for left, right in zip(parts, parts[1:])
+    )
 
 
 class Limits(BaseModel):
@@ -240,15 +272,7 @@ def build_snapshot(
         commit=commit,
         source=str(repo.resolve()),
         limits=limits,
-        versions={
-            name: importlib.metadata.version(name)
-            for name in (
-                "tree-sitter",
-                "tree-sitter-java",
-                "tree-sitter-typescript",
-                "tree-sitter-javascript",
-            )
-        },
+        versions=parser_versions(),
     )
     # 先落盘INDEXING；进程被中断/原生扩展崩溃时也不会留下可查询的半成品。
     save_manifest(output, manifest)
@@ -289,16 +313,15 @@ def build_snapshot(
             if mode == b"120000" or kind != b"blob":
                 file.reason = "link_or_submodule"
                 continue
-            if EXCLUDED_DIRS.intersection(PurePosixPath(path).parts[:-1]) or (
-                suffix not in EXTENSIONS
-                and PurePosixPath(path).name not in CONFIG_NAMES
+            if excluded_directory(path) or (
+                not supported_file(path)
             ):
                 file.reason = "excluded_by_policy"
                 continue
             java_count += suffix == ".java"
-            source_count += suffix in {".java", ".ts", ".js"}
+            source_count += suffix in SOURCE_EXTENSIONS
             readable_count += 1
-            file.language = "java" if suffix == ".java" else LANGUAGES.get(suffix)
+            file.language = language_for(path)
             total_bytes += file.size_bytes
             if (
                 java_count > limits.max_java_files
@@ -325,12 +348,8 @@ def build_snapshot(
                 continue
             file.sha256 = digest(content)
             file.status = "text"
-            if suffix in {".java", ".ts", ".js"}:
-                parsed = (
-                    parse_java(content, path)
-                    if suffix == ".java"
-                    else parse_frontend(content, path, LANGUAGES[suffix])
-                )
+            if suffix in LANGUAGES:
+                parsed = parse_source(content, path, file.language)
                 # 语法错误保留可读文本但不写入部分符号，避免把不完整结构当精确索引。
                 file.status = (
                     "parsed" if parsed.parse_status == "parsed" else "text_only"
@@ -338,15 +357,15 @@ def build_snapshot(
                 if file.status == "parsed":
                     symbols.extend(parsed.symbols)
                 else:
-                    file.reason = "syntax_error"
-            elif suffix in {".vue", ".tsx", ".jsx", ".mjs", ".cjs"}:
+                    file.reason = "syntax_error" if parsed.parse_status == "syntax_error" else "parser_unavailable"
+            elif suffix in SOURCE_EXTENSIONS or suffix == ".vue":
                 file.status, file.reason = "text_only", "structure_not_supported"
             target = contained(output / "content", path)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
             texts[path] = text
-        if not any(file.status == "parsed" for file in manifest.files):
-            raise ValueError("No structurally parsed source files")
+        if not texts:
+            raise ValueError("No readable repository files")
         # 使用参数化 SQL；索引与源文件同属于此快照，不依赖原仓库工作区。
         with closing(sqlite3.connect(output / "index.sqlite3")) as db, db:
             db.executescript(
@@ -374,9 +393,7 @@ def build_snapshot(
                         s.owner,
                         s.start_line,
                         s.end_line,
-                        "java"
-                        if s.path.endswith(".java")
-                        else LANGUAGES[PurePosixPath(s.path).suffix.lower()],
+                        language_for(s.path),
                     )
                     for s in symbols
                 ],
@@ -386,7 +403,8 @@ def build_snapshot(
         manifest.index_sha256 = digest(index.read_bytes())
         manifest.state = (
             "PARTIAL"
-            if any(file.status in {"skipped", "text_only"} for file in manifest.files)
+            if not any(file.status == "parsed" for file in manifest.files)
+            or any(file.status in {"skipped", "text_only"} for file in manifest.files)
             else "READY"
         )
     except (OSError, ValueError, sqlite3.Error) as error:

@@ -6,9 +6,8 @@ import tree_sitter_javascript
 import tree_sitter_typescript
 from tree_sitter import Language, Parser
 
-from repoagent.snapshots.java import MAX_FILE_BYTES, JavaParseResult, JavaSymbol
+from repoagent.snapshots.symbols import MAX_FILE_BYTES, ParseResult, Symbol
 
-LANGUAGES = {".ts": "typescript", ".js": "javascript"}
 DECLARATIONS = {
     "class_declaration": "class",
     "abstract_class_declaration": "class",
@@ -24,11 +23,13 @@ DECLARATIONS = {
 }
 
 
-def parse_frontend(source: bytes, path: str, language: str) -> JavaParseResult:
+def parse_frontend(source: bytes, path: str, language: str) -> ParseResult:
     if len(source) > MAX_FILE_BYTES:
         raise ValueError("Source exceeds the 1 MiB file limit")
     normalized = source.decode("utf-8-sig").encode("utf-8")
-    if language == "typescript":
+    if language == "tsx":
+        grammar = tree_sitter_typescript.language_tsx()
+    elif language == "typescript":
         grammar = tree_sitter_typescript.language_typescript()
     elif language == "javascript":
         grammar = tree_sitter_javascript.language()
@@ -63,7 +64,7 @@ def parse_frontend(source: bytes, path: str, language: str) -> JavaParseResult:
                 kind = "function"
             identity = f"{path}:{node.type}:{node.start_byte}:{node.end_byte}"
             symbols.append(
-                JavaSymbol(
+                Symbol(
                     symbol_id=sha256(identity.encode()).hexdigest()[:24],
                     path=path,
                     kind=kind,
@@ -86,7 +87,7 @@ def parse_frontend(source: bytes, path: str, language: str) -> JavaParseResult:
                 finished = True
                 break
             owners.pop()
-    return JavaParseResult(
+    return ParseResult(
         path=path,
         content_sha256=sha256(source).hexdigest(),
         parse_status="syntax_error" if tree.root_node.has_error else "parsed",

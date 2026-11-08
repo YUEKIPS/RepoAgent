@@ -5,7 +5,6 @@
 """
 
 import hashlib
-import importlib.metadata
 import json
 import sqlite3
 import threading
@@ -20,14 +19,18 @@ from repoagent.repositories.text import (
     decode_text,
     profile,
 )
-from repoagent.snapshots.frontend import LANGUAGES, parse_frontend
-from repoagent.snapshots.java import parse_java
+from repoagent.snapshots.languages import (
+    LANGUAGES,
+    SOURCE_EXTENSIONS,
+    language_for,
+    parse_source,
+    parser_versions,
+)
 from repoagent.snapshots.repository import (
-    CONFIG_NAMES,
-    EXCLUDED_DIRS,
-    EXTENSIONS,
     Limits,
+    excluded_directory,
     safe_relative,
+    supported_file,
 )
 from repoagent.storage import guard_database
 
@@ -36,27 +39,14 @@ def encode(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
 
 
-def parser_versions():
-    return {
-        name: importlib.metadata.version(name)
-        for name in (
-            "tree-sitter",
-            "tree-sitter-java",
-            "tree-sitter-typescript",
-            "tree-sitter-javascript",
-        )
-    } | {"index_policy": "n3-index-v1"}
-
-
 def file_policy(entry):
-    path = Path(entry["path"])
     if entry["type"] == "tree":
         return "directory"
     if entry["mode"] not in {"100644", "100755"}:
         return "links_or_submodules"
-    if set(path.parts) & EXCLUDED_DIRS:
+    if excluded_directory(entry["path"]):
         return "excluded_directory"
-    if path.suffix not in EXTENSIONS and path.name not in CONFIG_NAMES:
+    if not supported_file(entry["path"]):
         return "unsupported_file"
     if entry["size"] > Limits().max_file_bytes:
         return "file_too_large"
@@ -174,7 +164,7 @@ class RepositoryStore:
         if (
             sum(Path(e["path"]).suffix == ".java" for e in allowed)
             > limits.max_java_files
-            or sum(Path(e["path"]).suffix in {".java", ".ts", ".js"} for e in allowed)
+            or sum(Path(e["path"]).suffix.lower() in SOURCE_EXTENSIONS for e in allowed)
             > limits.max_source_files
         ):
             raise GitHubError("catalog_policy_limit")
@@ -187,7 +177,7 @@ class RepositoryStore:
             "commit": commit,
             "tree": tree,
             "catalog": catalog,
-            "policy": "n3-files-v1",
+            "policy": "mainstream-files-v1",
         }
         allowed_paths = {e["path"] for e in allowed}
         if set(text_profile["overrides"]) - allowed_paths:
@@ -435,17 +425,13 @@ class RepositoryStore:
         decoded = self.text_view(version, path, data)
         parse_input = decoded.utf8
         suffix, state, symbols, reason = (
-            Path(path).suffix,
+            Path(path).suffix.lower(),
             "text_only",
             [],
             "text_only_language",
         )
-        if suffix in {".java", ".ts", ".js"}:
-            result = (
-                parse_java(parse_input, path)
-                if suffix == ".java"
-                else parse_frontend(parse_input, path, LANGUAGES[suffix])
-            )
+        if suffix in LANGUAGES:
+            result = parse_source(parse_input, path, language_for(path))
             if result.parse_status == "parsed":
                 state, symbols, reason = (
                     "parsed",
@@ -453,7 +439,7 @@ class RepositoryStore:
                     "",
                 )
             else:
-                reason = "syntax_error"
+                reason = "syntax_error" if result.parse_status == "syntax_error" else "parser_unavailable"
         with self.connect() as db:
             row = db.execute(
                 "SELECT c.digest FROM materializations m JOIN content_objects c ON c.digest=m.digest WHERE m.revision=? AND m.path=?",
