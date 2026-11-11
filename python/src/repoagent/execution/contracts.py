@@ -247,6 +247,30 @@ class Answer(StrictModel):
     limitations: list[str] = Field(default_factory=list)
 
 
+# 局部修正仅能替换引用；来源身份和结论关联由宿主补齐。
+class CitationRange(StrictModel):
+    evidence_id: str
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+
+
+class CitationUpdate(StrictModel):
+    citation_index: int = Field(ge=0)
+    replacement: list[CitationRange] = Field(min_length=1, max_length=40)
+
+
+class CitationPatch(StrictModel):
+    candidate_revision: str = Field(pattern=r"^[a-f0-9]{64}$")
+    status: Literal["patch", "needs_evidence", "needs_answer_revision"]
+    citation_updates: list[CitationUpdate] = Field(default_factory=list, max_length=40)
+
+    @model_validator(mode="after")
+    def matching_updates(self):
+        if bool(self.citation_updates) != (self.status == "patch"):
+            raise ValueError("Patch status and updates do not match")
+        return self
+
+
 # 工具请求契约：名称、参数和调用ID；宿主仍需白名单及参数模型校验。
 class ToolCall(StrictModel):
     """工具调用必须带显式关联身份。"""
@@ -306,6 +330,10 @@ class ModelRequest(StrictModel):
     query: Query
     evidence: list[Evidence] = Field(default_factory=list)
     available_tools: list[dict] = Field(default_factory=list)
+    evidence_namespace: str = ""
+    evidence_view_revision: int = Field(default=0, ge=0)
+    evidence_rebase: bool = False
+    deferred_evidence_ids: list[str] = Field(default_factory=list)
     # 工具观测是数据，不拥有修改系统权限的效力。
     observations: list[Observation] = Field(default_factory=list)
     omitted_observations: int = Field(default=0, ge=0)
@@ -325,17 +353,18 @@ class ModelRequest(StrictModel):
 
 # 统一内部响应：规划、最终回答、单工具或批工具，kind决定唯一载荷。
 class ModelResponse(StrictModel):
-    kind: Literal["plan", "answer", "tool_call", "tool_calls", "summary"]
+    kind: Literal["plan", "answer", "tool_call", "tool_calls", "summary", "citation_patch"]
     plan: Plan | None = None
     answer: Answer | None = None
     tool_call: ToolCall | None = None
     tool_calls: list[ToolCall] | None = Field(default=None, min_length=1, max_length=8)
     summary: SummaryResult | None = None
+    citation_patch: CitationPatch | None = None
 
     @model_validator(mode="after")
     def matching_payload(self):
         """根据kind检查恰好一个对应载荷存在；拒绝混合或缺失的响应。"""
-        for name in ("plan", "answer", "tool_call", "tool_calls", "summary"):
+        for name in ("plan", "answer", "tool_call", "tool_calls", "summary", "citation_patch"):
             if (getattr(self, name) is not None) != (self.kind == name):
                 raise ValueError("Response kind and payload do not match")
         return self
@@ -348,6 +377,9 @@ class AgentState(StrictModel):
     evidence: list[Evidence] = Field(default_factory=list)
     call_ids: list[str] = Field(default_factory=list)
     signatures: list[str] = Field(default_factory=list)
+    consecutive_no_progress: int = Field(default=0, ge=0)
+    recovered_signatures: list[str] = Field(default_factory=list)
+    cached_tool_calls: dict[str, str] = Field(default_factory=dict)
     session_id: str | None = None
     run_id: str | None = None
     applied_event_seq: int = Field(default=0, ge=0)

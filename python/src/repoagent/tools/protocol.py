@@ -124,7 +124,7 @@ ARGUMENTS = {
     "expand_evidence": ExpandArgs,
 }
 DESCRIPTIONS = {
-    "expand_evidence": "Expand original source evidence_ids from this task's cold catalog into the next request. Or supply only catalog_cursor to page the non-citable catalog, using cold_evidence_next_cursor/next_cursor. Catalog entries are not citable until expanded; does not fetch another repository or version. On evidence_selection_capacity request fewer IDs, or use read_file with a smaller whole-line range to create a usable fragment.",
+    "expand_evidence": "Request original evidence_ids from this task for the next model input. Already visible IDs are idempotent; cold IDs are restored locally. Or supply only catalog_cursor to page the non-citable catalog. Only IDs in the actual next input's citation_policy are citable. On context_capacity request fewer IDs, or use read_file with a smaller whole-line range to create a new immutable fragment. Does not fetch another repository or version.",
     "list_directory": "列当前快照目录；排除文件可见不代表可读。按next_cursor分页。",
     "search_code": "Literal search: text=source text (case-preserving matches preferred), path=file path, symbol=indexed type/method identifier (not fields). Multiple queries are merged round-robin by their own relevance. Use text for field names/annotations. No matches do not prove absence; paginate with next_cursor.",
     "read_file": "只读原文，最多200行/16KiB。按continuation行列续读；半行不提供引用。",
@@ -171,7 +171,7 @@ def arguments(call: ToolCall) -> dict:
 
 class EvidenceParameterError(ToolParameterError):
     def __init__(self, code):
-        self.code = code if code in {"unknown_evidence_id", "evidence_selection_capacity", "invalid_evidence_cursor"} else "invalid_parameters"
+        self.code = code if code in {"unknown_evidence_id", "context_capacity", "invalid_evidence_cursor"} else "invalid_parameters"
         super().__init__(self.code)
 
 

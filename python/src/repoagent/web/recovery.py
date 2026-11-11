@@ -23,7 +23,7 @@ class RecoveryCoordinator:
             return None, "checkpoint_version_mismatch"
         if time.time() < saved["saved_wall"] - 2:
             return None, "checkpoint_clock_changed"
-        if time.time() >= saved["deadline_at"]:
+        if saved["deadline_at"] is not None and time.time() >= saved["deadline_at"]:
             return None, "checkpoint_expired"
         if saved["phase"] == "execution_failed":
             return None, "checkpoint_execution_failed"

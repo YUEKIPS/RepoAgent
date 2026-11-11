@@ -105,7 +105,6 @@ def validate_formal_parameters(c, config):
         "max_tool_calls",
         "deadline_seconds",
         "max_input_estimate",
-        "evidence_estimate",
         "top_k",
         "initial_max_reads",
     ):

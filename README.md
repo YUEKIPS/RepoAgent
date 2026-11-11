@@ -4,7 +4,16 @@
 
 RepoAgent 是一个在本地运行的代码仓库问答工具。添加公开 GitHub 仓库后，可以询问功能实现、调用流程或异常条件，并通过回答中的文件路径、行号和源码片段核对结论。也可以选定多个仓库，分析前后端接口或不同项目之间的协作关系。
 
-版本：**v1.0.0**。
+版本：**v1.1.0**。
+
+### 本版更新
+
+- 按完整上下文压力管理源码证据，未到容量压力时继续保留已读原文；引用依据实际发送的证据范围核查。
+- 引用的小范围错误优先局部修正，避免为了改行号反复重写整份回答。
+- 稳定规则与历史消息的组织方式，减少不必要的缓存前缀变化；实际用量以服务返回为准。
+- 连续生成不再因单次响应总时长被截断。样例配置的120秒表示网络空闲上限，连接最多等待15秒；用户停止和显式整题时限仍有效。整题时限留空表示不限时。
+
+使用新的数据目录`work/web-v1.1.0`，保留旧版目录即可继续用对应旧版查看历史；本版不迁移或加载v1.0.0数据。详见[更新记录](CHANGELOG.md)。
 
 ## 可以用它做什么
 
@@ -67,12 +76,12 @@ notepad .env
 DEEPSEEK_API_KEY=你的API密钥
 ```
 
-`config/model.json` 包含服务地址、模型名、上下文窗口、工具调用及输出能力等配置。更换模型服务时，应按实际接口能力调整；仅修改模型名不保证兼容。
+`config/model.json` 包含服务地址、模型名、网络空闲等待、上下文窗口、工具调用及输出能力等配置。更换模型服务时，应按实际接口能力调整；仅修改模型名不保证兼容。
 
 ### 3. 启动
 
 ```powershell
-.\.venv\Scripts\python.exe -m repoagent.web --model-config config/model.json --env-file .env --initial-model-source live --output-dir work/web --usage-ledger work/web/usage.sqlite3 --port 8765
+.\.venv\Scripts\python.exe -m repoagent.web --model-config config/model.json --env-file .env --initial-model-source live --output-dir work/web-v1.1.0 --usage-ledger work/web-v1.1.0/usage.sqlite3 --port 8765
 ```
 
 在浏览器打开 **http://127.0.0.1:8765/**。按 `Ctrl+C` 停止；再次使用同一命令启动即可沿用数据。端口已被占用时，可把 `--port` 改为其他空闲端口。
@@ -86,12 +95,12 @@ DEEPSEEK_API_KEY=你的API密钥
 3. 输入问题；需要时附加日志，调整回答详略或原生思考选项。
 4. 展开引用核对原文，继续追问。
 
-一个对话的仓库范围和版本在创建后固定。需要分析另一组仓库或更新版本时，新建对话即可。运行设置可调整后续任务的请求次数、时限、摘要和证据预算；已运行的任务保持启动时的参数。
+一个对话的仓库范围和版本在创建后固定。需要分析另一组仓库或更新版本时，新建对话即可。运行设置可调整后续任务的请求次数、整题时限、摘要和上下文保护参数；已运行的任务保持启动时的参数。
 
 ## 不配置密钥，先看界面
 
 ```powershell
-.\.venv\Scripts\python.exe -m repoagent.web --mock-script examples/offline.json --output-dir work/offline --port 8766
+.\.venv\Scripts\python.exe -m repoagent.web --mock-script examples/offline.json --output-dir work/offline-v1.1.0 --port 8766
 ```
 
 打开 **http://127.0.0.1:8766/**。此模式使用预设响应，不具备任意问题的理解能力，也不调用模型；初始仓库池为空。主动添加仓库仍会访问 GitHub。
@@ -114,7 +123,7 @@ GitHub 令牌和模型密钥应分别配置。令牌不会将产品的访问范�
 
 ## 数据与隐私
 
-- 对话、源码缓存、引用、检查点和用量记录保存在启动命令指定的 `work/web` 中，不包含在本仓库中。
+- 对话、源码缓存、引用、检查点和用量记录保存在启动命令指定的 `work/web-v1.1.0` 中，不包含在本仓库中。
 - 备份前先停止服务，再复制完整数据目录；不同服务不要共用一个数据目录。
 - 不要提交 `.env`、实际配置、运行数据或日志；项目的 `.gitignore` 已排除常见路径。
 - 升级时使用与版本匹配的数据目录；本版不自动迁移旧版本数据库。

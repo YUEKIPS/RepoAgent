@@ -19,6 +19,7 @@ from repoagent.execution.contracts import (
     AgentState,
     Answer,
     Evidence,
+    ModelRequest,
     ModelResponse,
     Observation,
     Query,
@@ -42,7 +43,12 @@ from repoagent.execution.publication import (
     citations_with_context as citations_with_context,
 )
 from repoagent.execution.publication import validate_citations as validate_citations
-from repoagent.execution.repair import RepairPolicy
+from repoagent.execution.repair import (
+    RepairPolicy,
+    apply_citation_patch,
+    full_rewrite_feedback,
+    is_citation_patch,
+)
 from repoagent.execution.tool_pipeline import ToolPipeline
 from repoagent.models.base import (
     ModelBudgetError,
@@ -58,7 +64,7 @@ from repoagent.tools.protocol import SCHEMA_VERSION, Dispatcher, builtin_registr
 from repoagent.tools.store import source_lines
 from repoagent.tools.workspace import WorkspaceTools
 
-PROTOCOL_VERSION = "controlled-execution-v30-pressure"
+PROTOCOL_VERSION = "controlled-execution-v35-io-timeouts"
 
 
 # 可配对复用的准备结果：查询、限制、模型ID、证据、用量、轨迹与耗时。
@@ -186,10 +192,7 @@ class Execution:
                 if source.context is None:
                     raise ValueError("Remote sources need a host-bound run")
                 source.context.budget.cancelled = cancelled
-                source.context.budget.remaining = lambda: (
-                    self.limits.deadline_seconds
-                    - (self.clock() - self.started + self.preparation_seconds)
-                )
+                source.context.budget.remaining = self.remaining_seconds
                 source.store.begin_run(source.context.owner, self.task_id)
         self.preparation_seconds = 0.0
         self.session = ModelSession.for_execution(
@@ -198,10 +201,7 @@ class Execution:
             task_id=self.task_id,
             usage=self.usage,
             guard=self.guard,
-            remaining=lambda: (
-                self.limits.deadline_seconds
-                - (self.clock() - self.started + self.preparation_seconds)
-            ),
+            remaining=self.remaining_seconds,
             cancelled=self.cancelled,
             limits=self.limits,
         )
@@ -227,7 +227,9 @@ class Execution:
         self.publisher = AnswerPublisher()
         self.checkpoint_sink, self.stream_sink = checkpoint_sink, stream_sink
         self.summary_sink = summary_sink
-        self.deadline_at = deadline_at or (time.time() + self.limits.deadline_seconds)
+        self.deadline_at = deadline_at
+        if self.deadline_at is None and self.limits.deadline_seconds is not None:
+            self.deadline_at = time.time() + self.limits.deadline_seconds
         self.repair_policy = RepairPolicy()
         self.repair_feedback = None
         self.candidate_revision = 0
@@ -256,14 +258,19 @@ class Execution:
     def _after_response(self, response):
         from repoagent.execution.contracts import ModelRequest
         self.pending_response = response
-        kind = {"plan": "assistant/plan", "summary": "context/summary_response"}.get(response.kind, "assistant/message")
+        kind = {"plan": "assistant/plan", "summary": "context/summary_response", "citation_patch": "assistant/citation_patch"}.get(response.kind, "assistant/message")
         self.conversation_session.append(kind, {
             "run_id": self.task_id, "step": self.journal.sequence,
             "response": response.model_dump(),
-        }, surface_op="append" if kind == "assistant/message" else None)
+        }, surface_op="append" if kind == "assistant/message" and response.kind != "citation_patch" else None)
+        if self.prepared_identity:
+            request = ModelRequest.model_validate_json(self.prepared_identity["request_json"])
+            if request.stage != "summary":
+                self.evidence_manager.commit_view(e.evidence_id for e in request.evidence)
+                self.evidence_manager.decision_completed([e.evidence_id for e in request.evidence] + request.deferred_evidence_ids)
         if response.kind == "plan":
             self.initial_plan = response.plan
-        elif response.kind == "answer" and self.prepared_identity:
+        elif response.kind in {"answer", "citation_patch"} and self.prepared_identity:
             request = ModelRequest.model_validate_json(self.prepared_identity["request_json"])
             self.answer_evidence = request.evidence
         self.checkpoint("context_compacting" if self.context_compacting else "response_ready")
@@ -274,6 +281,7 @@ class Execution:
             "configuration_id": prepared.configuration_id,
             "payload": prepared.payload.decode("utf-8"),
             "request_json": prepared.request_json.decode("utf-8"),
+            "evidence_manifest": prepared.evidence_manifest,
             "attempt_id": ticket.attempt_id if ticket else None,
             "measurement": prepared.measurement,
             "registry_fingerprint": self.registry.fingerprint,
@@ -330,7 +338,7 @@ class Execution:
                 "initial_plan": self.initial_plan.model_dump() if self.initial_plan else None,
                 "initial_hits": self.initial_hits, "initial_cursor": self.initial_cursor,
                 "initial_complete": self.initial_complete,
-                "selection": {"pinned": self.evidence_manager.pinned, "active_ids": self.evidence_manager.active_ids, "revision": self.evidence_manager.revision},
+                "selection": {"pinned": self.evidence_manager.pinned, "active_ids": self.evidence_manager.active_ids, "cold_ids": self.evidence_manager.cold_ids, "revision": self.evidence_manager.revision},
                 "network": self._network_checkpoint(),
                 "prepared_identity": self.prepared_identity,
             })
@@ -356,15 +364,31 @@ class Execution:
             raise ValueError("Summary response is unavailable")
         if saved["execution_version"] != PROTOCOL_VERSION or saved["limits"] != self.limits.model_dump() or saved["query"]["workspace"] != self.query.workspace.model_dump():
             raise ValueError("Checkpoint binding mismatch")
-        if time.time() < saved["saved_wall"] - 2 or time.time() >= saved["deadline_at"]:
+        if time.time() < saved["saved_wall"] - 2 or (
+            saved["deadline_at"] is not None and time.time() >= saved["deadline_at"]
+        ):
             raise ValueError("Checkpoint deadline expired or clock changed")
         self.deadline_at = saved["deadline_at"]
         self.task_id = saved["task_id"]
         self.session.task_id = self.task_id
         self.journal.run_id = self.task_id
-        self.preparation_seconds = self.limits.deadline_seconds - max(0, self.deadline_at - time.time())
+        self.preparation_seconds = (
+            self.limits.deadline_seconds - max(0, self.deadline_at - time.time())
+            if self.limits.deadline_seconds is not None else 0.0
+        )
         self.query = Query.model_validate(saved["query"])
         self.prepared_identity = saved.get("prepared_identity")
+        if self.prepared_identity:
+            from repoagent.models.base import PreparedCall
+            from repoagent.models.evidence_view import verify_manifest
+            identity = self.prepared_identity
+            payload = identity["payload"].encode()
+            frozen = PreparedCall(identity["call_id"], identity["configuration_id"], payload,
+                                  identity["request_json"].encode(), None, len(payload),
+                                  evidence_manifest_json=json.dumps(identity["evidence_manifest"]).encode())
+            if frozen.wire_sha256 != identity["wire_sha256"]:
+                raise ValueError("Checkpoint prepared payload mismatch")
+            verify_manifest(frozen, ModelRequest.model_validate_json(frozen.request_json), simulated=self.session.simulated)
         self.pressure_pending = saved.get("pressure_pending")
         if self.pressure_pending:
             request = json.loads(self.prepared_identity["request_json"])
@@ -412,6 +436,17 @@ class Execution:
         """从独立请求记录刷新本任务/本批次的实际token及完整性；模拟不查询。"""
         self.session.refresh_usage()
 
+    def remaining_seconds(self):
+        """None means no task deadline; per-request/network timeouts stay separate."""
+        remaining = float("inf")
+        if self.limits.deadline_seconds is not None:
+            remaining = self.limits.deadline_seconds - (
+                self.clock() - self.started + self.preparation_seconds
+            )
+        if getattr(self, "deadline_at", None) is not None:
+            remaining = min(remaining, self.deadline_at - time.time())
+        return remaining
+
     def guard(self):
         """检查取消和累计deadline，触发时抛StopExecution。
 
@@ -419,11 +454,7 @@ class Execution:
         """
         if self.cancelled():
             raise StopExecution("CANCELLED", "cancelled")
-        if (
-            self.clock() - self.started + self.preparation_seconds
-            >= self.limits.deadline_seconds
-            or (hasattr(self, "deadline_at") and time.time() >= self.deadline_at)
-        ):
+        if self.remaining_seconds() <= 0:
             raise StopExecution("BUDGET_EXCEEDED", "deadline")
 
     def stop_retrieval(self, reason: str):
@@ -533,7 +564,10 @@ class Execution:
                 "evidence_ranges": [
                     e.model_dump(exclude={"text"}) for e in message.evidence
                 ],
-                "sent_evidence_manifest": [e.model_dump(exclude={"text"}) | {"text_sha256": __import__("hashlib").sha256(e.text.encode()).hexdigest()} for e in message.evidence],
+                "sent_evidence_manifest": prepared_call.evidence_manifest,
+                "hot_evidence_count": len(message.evidence),
+                "cold_evidence_count": len(self.state.evidence) - len(message.evidence),
+                "registered_evidence_bytes": estimate([e.model_dump() for e in self.state.evidence]),
                 "selection_revision": built.selection_revision,
                 "session_event_count": self.conversation_session.seq,
                 "session_surface": list(self.conversation_session.surface),
@@ -548,7 +582,7 @@ class Execution:
         previous_records = len(self.session.records)
         self.journal.start(stage)
         self.candidate_revision += 1
-        if self.stream_sink:
+        if self.stream_sink and not is_citation_patch(message.repair_feedback):
             self.stream_sink({"event": "draft_start", "candidate_revision": self.candidate_revision})
         self.checkpoint("model_pending")
         try:
@@ -571,8 +605,6 @@ class Execution:
                 )
             self.refresh_usage()
         response = ModelResponse.model_validate(response.model_dump())
-        # An expansion is pinned through this completed model decision, not forever.
-        self.evidence_manager.pinned = []
         self.journal.responded(response.kind)
         size = estimate(response.model_dump())
         self.trace.append(
@@ -582,9 +614,11 @@ class Execution:
         if self.model.simulated and output_limit is not None and size > output_limit:
             raise StopExecution("BUDGET_EXCEEDED", "output_estimate")
         allowed = {"answer", "tool_call", "tool_calls"} if stage == "act" else {stage}
+        if is_citation_patch(message.repair_feedback):
+            allowed = {"citation_patch"}
         if response.kind not in allowed:
             raise StopExecution("FAILED", "unexpected_model_response")
-        if stage == "act" and not can_use_tools and response.kind != "answer":
+        if stage == "act" and not can_use_tools and response.kind not in {"answer", "citation_patch"}:
             if self.finalization_reason:
                 raise StopExecution("FAILED", "tool_requested_after_finalization")
             reason = (
@@ -595,8 +629,13 @@ class Execution:
                 else "input_estimate"
             )
             raise StopExecution("BUDGET_EXCEEDED", reason)
-        if response.kind == "answer":
+        if response.kind in {"answer", "citation_patch"}:
             self.answer_evidence = [e.model_copy(deep=True) for e in message.evidence]
+        # Only an accepted investigation/answer decision consumes the lease.
+        # Ending a lease does not cool source; pressure is the only cooler.
+        if stage != "summary":
+            self.evidence_manager.commit_view(e.evidence_id for e in message.evidence)
+            self.evidence_manager.decision_completed([e.evidence_id for e in message.evidence] + message.deferred_evidence_ids)
         self.pending_response = response
         if response.kind == "plan":
             self.initial_plan = response.plan
@@ -637,14 +676,27 @@ class Execution:
             ),
             None,
         )
-        outcome = (prior.outcome.model_copy(update={"call_id": call.call_id})
-                   if prior else self.dispatcher.execute(call))
+        try:
+            cache_key = json.dumps([call.name, self.registry.arguments(call), self.tools.generations()], sort_keys=True, ensure_ascii=False)
+        except (KeyError, ValueError):
+            cache_key = None
+        cacheable = call.name in {"read_file", "get_symbol", "search_code", "list_directory"} and self.registry.spec(call.name).origin == "builtin"
+        cached_id = self.state.cached_tool_calls.get(cache_key) if cacheable else None
+        cached = next((event["data"]["observation"]["outcome"] for event in reversed(self.conversation_session.events())
+                       if event["type"] == "tool/settled" and event["data"]["observation"]["call"]["call_id"] == cached_id), None) if cached_id and call.name != "expand_evidence" else None
+        outcome = (prior.outcome.model_copy(update={"call_id": call.call_id}) if prior else
+                   ToolOutcome.model_validate(cached).model_copy(update={"call_id": call.call_id}) if cached else self.dispatcher.execute(call))
+        if cached:
+            self.trace.append({"event": "tool_result_reused", "call_id": call.call_id, "original_call_id": cached_id})
         if prior:
             self.trace.append({"event": "file_error_reused", "call_id": call.call_id})
         self.conversation_session.append("tool/settled", {
             "run_id": self.task_id, "step": self.journal.sequence,
             "observation": Observation(call=call, outcome=outcome).model_dump(),
         })
+        if outcome.ok and cache_key is not None and cacheable:
+            settled_key = json.dumps([call.name, self.registry.arguments(call), self.tools.generations()], sort_keys=True, ensure_ascii=False)
+            self.state.cached_tool_calls[settled_key] = call.call_id
         if not outcome.ok and outcome.error.code in {
             "connection_or_tls_failed",
             "dns_timeout",
@@ -924,6 +976,27 @@ class Execution:
         result.trace = self.trace.copy()
         return result
 
+    def accept_response(self, response):
+        if response.kind != "citation_patch":
+            return self.accept_candidate(response.answer)
+        evidence = self.answer_evidence
+        try:
+            patched = apply_citation_patch(self.repair_feedback, response.citation_patch, evidence)
+        except (ValueError, KeyError, TypeError):
+            raise StopExecution("FAILED", "citation_patch_invalid") from None
+        self.pending_response = None
+        if patched is None:
+            self.trace.append({"event": "citation_patch_fallback", "reason": response.citation_patch.status})
+            self.repair_feedback = full_rewrite_feedback(self.repair_feedback)
+            self.checkpoint("ready")
+            return None
+        if self.publisher.validate_candidate(patched, evidence, self.state.evidence):
+            raise StopExecution("FAILED", "citation_patch_invalid")
+        self.trace.append({"event": "citation_patch_applied", "candidate_revision": response.citation_patch.candidate_revision,
+                           "citation_indices": [u.citation_index for u in response.citation_patch.citation_updates]})
+        self.repair_feedback = None
+        return self.finish(patched)
+
     def accept_candidate(self, answer):
         evidence = self.answer_evidence if self.answer_evidence is not None else self.state.evidence
         issues = self.publisher.validate_candidate(answer, evidence, self.state.evidence)
@@ -936,6 +1009,8 @@ class Execution:
         if feedback is None:
             raise StopExecution("FAILED", "citation_repair_no_progress")
         self.repair_feedback = feedback
+        candidate_ids = {c.evidence_id for c in answer.citations}
+        self.evidence_manager.protect(e.evidence_id for e in self.state.evidence if e.evidence_id in candidate_ids)
         self.trace.append({"event": "citation_repair", "issues": issues, "attempt": self.repair_policy.attempts})
         self.pending_response = None
         self.checkpoint("ready")
@@ -1023,8 +1098,8 @@ class Execution:
                 if self.finalization_reason == "tool_calls" and not self.state.evidence:
                     raise StopExecution("BUDGET_EXCEEDED", "tool_calls")
                 while True:
-                    response = self.pending_response if self.pending_response and self.pending_response.kind == "answer" else self.request("answer")
-                    result = self.accept_candidate(response.answer)
+                    response = self.pending_response if self.pending_response and self.pending_response.kind in {"answer", "citation_patch"} else self.request("answer")
+                    result = self.accept_response(response)
                     if result:
                         return result
             # 单Agent反馈循环：请求动作→校验工具→执行并追加观测→下一轮；guard强制有限运行。
@@ -1034,10 +1109,10 @@ class Execution:
                     self.pending_calls = []
                 else:
                     response = self.pending_response if self.pending_response and self.pending_response.kind != "plan" else self.request("act")
-                if self.source_failure and response.kind != "answer":
+                if self.source_failure and response.kind not in {"answer", "citation_patch"}:
                     raise StopExecution("FAILED", "tool_requested_after_source_stop")
-                if response.kind == "answer":
-                    result = self.accept_candidate(response.answer)
+                if response.kind in {"answer", "citation_patch"}:
+                    result = self.accept_response(response)
                     if result:
                         return result
                     continue
@@ -1061,6 +1136,8 @@ class Execution:
                 self.pending_calls = calls.copy()
                 self.pending_response = None
                 self.checkpoint("tools_pending")
+                batch_fresh = False
+                batch_recovered = []
                 for call in calls:
                     try:
                         params = self.registry.arguments(call)
@@ -1076,28 +1153,42 @@ class Execution:
                         sort_keys=True,
                         ensure_ascii=False,
                     )
-                    if signature in self.state.signatures:
-                        self.stop_retrieval("no_progress")
-                        self.pending_calls = []
-                        self.checkpoint("ready")
-                        break
+                    seen = signature in self.state.signatures
                     self.state.call_ids.append(call.call_id)
-                    self.state.signatures.append(signature)
+                    if not seen:
+                        self.state.signatures.append(signature)
                     self.checkpoint("tool_inflight")
+                    before_ids = {e.evidence_id for e in self.evidence_manager.select("")}
+                    trace_start = len(self.trace)
                     self.observe(call, self.invoke(call))
+                    after_ids = {e.evidence_id for e in self.evidence_manager.select("")}
+                    coverage = next((t for t in reversed(self.trace[trace_start:]) if t["event"] == "evidence_coverage"), {})
+                    fresh = (coverage.get("new_lines", 0) > 0 if call.name == "read_file" else not seen and call.name != "expand_evidence")
+                    batch_fresh |= fresh
+                    if after_ids - before_ids and not fresh:
+                        batch_recovered.append(signature)
+                    self.trace.append({"event": "tool_progress", "call_id": call.call_id,
+                                       "kind": "new_information" if fresh else "context_restored" if after_ids - before_ids else "unchanged"})
                     if self.source_failure:
                         self.pending_calls = []
                         self.checkpoint("ready")
                         break
+                if batch_fresh:
+                    self.state.consecutive_no_progress = 0
+                    self.state.recovered_signatures = []
+                elif any(s not in self.state.recovered_signatures for s in batch_recovered):
+                    self.state.recovered_signatures = list(dict.fromkeys(self.state.recovered_signatures + batch_recovered))
+                else:
+                    self.state.consecutive_no_progress += 1
+                if self.state.consecutive_no_progress >= 2:
+                    self.stop_retrieval("no_progress")
+                self.checkpoint("ready")
         except StopExecution as error:
             return self.failed(error.status, error.reason)
         except ModelCancelledError:
             return self.failed("CANCELLED", "cancelled")
         except ModelTimeoutError:
-            if (
-                self.clock() - self.started + self.preparation_seconds
-                >= self.limits.deadline_seconds
-            ):
+            if self.remaining_seconds() <= 0:
                 return self.failed("BUDGET_EXCEEDED", "deadline")
             return self.failed("FAILED", "request_timeout")
         except ModelBudgetError as error:

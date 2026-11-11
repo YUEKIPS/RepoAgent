@@ -42,6 +42,8 @@ class ModelSession:
         self._issued, self._tickets = {}, {}
         self._used = set()
         self._continuations = []
+        self._cache_context = {}
+        self._cache_candidates = {}
         self.on_delta = None
         self.before_dispatch = None
         self.after_response = None
@@ -52,6 +54,7 @@ class ModelSession:
         self.limits = Limits()
         self.guard = self._default_guard
         self.remaining = lambda: (
+            float("inf") if self.limits.deadline_seconds is None else
             self.limits.deadline_seconds - (time.monotonic() - self._started)
         )
         self.cancelled = lambda: False
@@ -155,6 +158,19 @@ class ModelSession:
             )
         if prepared.configuration_id != self.generation_id:
             raise ModelServiceError(code="model_configuration_mismatch")
+        policy = getattr(self.adapter, "cache_policy", None)
+        positions = None
+        if policy and policy.enabled:
+            from repoagent.models.cache_context import render
+            payload, candidate = render(json.loads(prepared.payload), request, tuple(self._continuations), self._cache_context, policy)
+            wire = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+            prepared = replace(prepared, payload=wire, input_size=len(wire))
+            self._cache_candidates[prepared.call_id] = candidate
+            if policy.evidence and candidate:
+                positions = candidate["evidence_positions"]
+        from repoagent.models.evidence_view import manifest_for
+        manifest = manifest_for(prepared, request, positions, simulated=self.simulated)
+        prepared = replace(prepared, evidence_manifest_json=json.dumps(manifest, sort_keys=True).encode())
         capabilities = getattr(getattr(self.adapter, "config", None), "capabilities", None)
         measured = RequestMeter().measure(prepared, capabilities, self.limits, self.token_counter, self.meter_identity)
         prepared = replace(prepared, measurement_json=json.dumps(measured, sort_keys=True).encode())
@@ -170,6 +186,7 @@ class ModelSession:
         ):
             raise ModelBudgetError(code="invalid_prepared_call")
         del self._issued[prepared.call_id]
+        self._cache_candidates.pop(prepared.call_id, None)
 
     def rebase_continuation(self, covered_call_ids):
         """Drop only complete oldest native batches after a durable step summary."""
@@ -188,6 +205,7 @@ class ModelSession:
         if self._continuations and not covered <= seen:
             raise ModelServiceError(code="continuation_compaction_incomplete")
         self._continuations = self._continuations[last_covered + 1:]
+        self._cache_context = {}
 
     def _validate(self, prepared):
         if (
@@ -201,6 +219,9 @@ class ModelSession:
             raise ModelBudgetError(code="input_estimate")
         if not prepared.measurement.get("hard_fits", True):
             raise ModelBudgetError(code="context_window")
+        from repoagent.execution.contracts import ModelRequest
+        from repoagent.models.evidence_view import verify_manifest
+        verify_manifest(prepared, ModelRequest.model_validate_json(prepared.request_json), simulated=self.simulated)
         self.ensure_healthy()
         if self.usage.model_requests >= self.max_requests:
             raise ModelBudgetError(code="model_requests")
@@ -270,7 +291,8 @@ class ModelSession:
                 cancel = cancelled if cancelled is not None else self.cancelled
                 if cancel():
                     raise ModelCancelledError(code="cancelled")
-                remaining = min(self.remaining(), self.adapter.request_timeout)
+                # timeout约束调用方剩余总时间；适配器另管网络连接／空闲等待。
+                remaining = self.remaining()
                 if timeout is not None:
                     remaining = min(remaining, timeout)
                 if remaining <= 0:
@@ -370,6 +392,10 @@ class ModelSession:
                     )
                 else:
                     self._continuations.append(state)
+            if record.dispatch_state != "not_sent" and record.input_tokens is not None:
+                self._cache_context = self._cache_candidates.pop(prepared.call_id, {})
+            else:
+                self._cache_candidates.pop(prepared.call_id, None)
             self.refresh_usage()
             if not self.simulated and record.dispatch_state != "not_sent" and (record.input_tokens is None or record.output_tokens is None):
                 self._halted = True
@@ -432,9 +458,11 @@ class ModelSession:
         return {"generation_id": self.generation_id,
                 "meter_identity": self.meter_identity,
                 "continuations": [s.decode("utf-8") for s in self._continuations],
+                "cache_context": json.loads(json.dumps(self._cache_context)),
                 "halted": self._halted}
 
     def restore_state(self, state):
         if state["generation_id"] != self.generation_id or state["halted"] or state.get("meter_identity") != self.meter_identity:
             raise ModelServiceError(code="checkpoint_configuration_mismatch")
         self._continuations = [s.encode("utf-8") for s in state["continuations"]]
+        self._cache_context = json.loads(json.dumps(state["cache_context"]))

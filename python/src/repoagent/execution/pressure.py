@@ -16,6 +16,7 @@ class PressureCoordinator:
         if not force and not built.prepared_call.measurement.get("pressure"):
             return built
         execution.session.discard(built.prepared_call)
+        before_projection = built.prepared_call.measurement
         history = execution.conversation_session
         # Registration owns policy. Raw events remain immutable.
         runs = {event["data"]["run_id"] for event in history.events() if event["type"] == "tool/result"}
@@ -24,6 +25,10 @@ class PressureCoordinator:
             history.prune_observations(run, projected, execution.registry.fingerprint)
         execution.checkpoint("context_ready")
         built = build(True)
+        execution.trace.append({"event": "context_rebuilt", "reason": "request_pressure" if not force else "explicit_compaction",
+                                "before": before_projection, "after": built.prepared_call.measurement,
+                                "hot_evidence_ids": [e.evidence_id for e in built.message.evidence],
+                                "deferred_evidence_ids": built.message.deferred_evidence_ids})
         while force or built.prepared_call.measurement.get("pressure"):
             force = False
             before = built.prepared_call.measurement

@@ -9,6 +9,13 @@ function render(job) {
   $("inspection-context").textContent=`${jobScope(job)} · ${job.result?.citations?.length || 0}处引用`;
   $("raw").replaceChildren(node("pre",job.result?.answer || "当前任务尚未发布回答。"));
   $("task-meta").replaceChildren();
+  const contexts=(job.result?.trace || []).filter(e=>e.event==='request_context');
+  const latestContext=contexts.at(-1), rebuilds=(job.result?.trace || []).filter(e=>e.event==='context_rebuilt');
+  if(latestContext) {
+    const tokens=latestContext.measurement?.estimated_input_tokens;
+    $("task-meta").append(node("dt","上下文"),node("dd",`${tokens == null ? '未知' : tokens+' Token（估算）'} · 原文 ${latestContext.hot_evidence_count ?? latestContext.evidence_ranges?.length ?? 0}段 · 冷证据 ${latestContext.cold_evidence_count ?? 0}段`));
+    $("task-meta").append(node("dt","最近压缩"),node("dd",rebuilds.length ? (rebuilds.at(-1).reason==='request_pressure' ? '完整输入接近容量限制' : '主动压缩') : '未触发'));
+  }
   for (const [key,value] of [["任务", job.id],["仓库版本", job.workspace ? workspaceLabel(job.workspace) : `${job.repository} @ ${job.commit}`],["执行模式",job.mode],["模型来源",job.simulated ? "模拟" : "真实模型"],["任务状态", job.result ? `${job.result.execution_status} / ${job.result.answer_status || "无回答"}` : job.state],["停止原因", job.result?.stop_reason || job.error?.code || "等待完成"],["记录保存", job.artifact_saved ? "已保存" : job.state === "running" ? "执行中" : "请导出保留"]]) $("task-meta").append(node("dt",key),node("dd",value));
   const nextSourceVersion=JSON.stringify([job.id,job.result?.citations,job.result?.original_citations,job.result?.claims]);
   if(nextSourceVersion!==sourceVersion) {

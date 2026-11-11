@@ -76,14 +76,12 @@
           <label>输出额度<select id="output-mode"><option value="auto">自动 · 按模型服务</option><option value="custom">自定义单次上限</option></select></label>
           <label>通用输出上限<input id="limit-output" type="number" placeholder="自动" min="1"></label>
           <label>规划单独覆盖<input id="limit-plan-output" type="number" placeholder="跟随通用／自动" min="1"></label>
-          <label>累计证据容量<input id="limit-evidence" type="number" required></label>
           <label>单次输入保护上限（字节）<input id="limit-input" type="number" required></label>
           <label>模型请求次数<input id="limit-model" type="number" required></label>
           <label>工具动作次数<input id="limit-tools" type="number" required></label>
-          <label>任务时限（秒）<input id="limit-seconds" type="number" required></label>
+          <label>整题时限（秒，留空不限时）<input id="limit-seconds" type="number" placeholder="不限时"></label>
           <label>摘要后近期保留轮数<input id="limit-recent-turns" type="number" required></label>
           <label>摘要输出上限（token）<input id="limit-summary-output" type="number" required></label>
-          <label>活动原文容量<input id="limit-active-evidence" type="number" required></label>
           <label>冷证据目录容量<input id="limit-cold-catalog" type="number" required></label>
           <label><input id="summary-enabled" type="checkbox" checked> 历史较长时生成摘要</label>
           <label><input id="stream-enabled" type="checkbox" checked> 逐步显示生成正文</label>

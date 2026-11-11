@@ -10,7 +10,7 @@ class Limits(StrictModel):
 
     max_model_requests: int = Field(default=20, ge=1, le=100)
     max_tool_calls: int = Field(default=20, ge=1, le=100)
-    deadline_seconds: float = Field(default=300.0, gt=0, le=1800)
+    deadline_seconds: float | None = Field(default=None, gt=0, le=1800)
     max_input_estimate: int = Field(default=4000000, ge=1, le=16000000)
     context_window_tokens: int | None = Field(default=None, ge=1024)
     pressure_ratio: float = Field(default=0.8, gt=0, le=0.95)
@@ -23,13 +23,11 @@ class Limits(StrictModel):
     plan_output_estimate: int | None = Field(default=None, ge=1)
     function_output_limits: dict[str, int] = Field(default_factory=dict)
     observation_estimate: int = Field(default=1000, ge=128, le=16000)
-    evidence_estimate: int = Field(default=100000, ge=1, le=1000000)
     top_k: int = Field(default=5, ge=1, le=5)
     initial_max_reads: int = Field(default=2, ge=1, le=5)
     summary_enabled: bool = True
     summary_output_tokens: int = Field(default=1800, ge=256, le=16000)
     recent_turns: int = Field(default=2, ge=1, le=10)
-    active_evidence_bytes: int = Field(default=40000, ge=512, le=1000000)
     cold_catalog_bytes: int = Field(default=6000, ge=256, le=40000)
     final_request_reserve: int = Field(default=2, ge=1, le=5)
     stream: bool = True

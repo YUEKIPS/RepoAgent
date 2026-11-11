@@ -354,7 +354,6 @@ class ChatService:
                 "tool_calls": limits.max_tool_calls,
                 "seconds": limits.deadline_seconds,
                 "input_estimate": limits.max_input_estimate,
-                "evidence_estimate": limits.evidence_estimate,
                 "output_estimate": limits.max_output_estimate,
                 "estimation_unit": "UTF-8 JSON bytes",
             },
@@ -508,7 +507,10 @@ class ChatService:
             job = {
                 "id": command.request_id,
                 "state": "running",
-                "deadline_at": time.time() + command.limits.deadline_seconds,
+                "deadline_at": (
+                    time.time() + command.limits.deadline_seconds
+                    if command.limits.deadline_seconds is not None else None
+                ),
                 "repository": command.repository,
                 "mode": command.mode,
                 "question": query.question,

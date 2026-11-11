@@ -68,8 +68,8 @@ function showError(err) {if($("new-session-dialog")?.open){$("new-session-error"
 function workspaceLabel(workspace) {return workspace?.repositories?.map(r=>`${configuration?.repositories?.find(repo=>repo.id===r.repository)?.name || r.repository} @ ${r.commit.slice(0,12)}`).join(" ＋ ") || "";}
 function jobScope(job) {return job.workspace ? workspaceLabel(job.workspace) : `${job.repository} @ ${job.commit.slice(0,12)}`;}
 function chosenRepositories() {return LibraryUI.chosen();}
-const limitFields = {"limit-recent-turns":"recent_turns","limit-summary-output":"summary_output_tokens","limit-active-evidence":"active_evidence_bytes","limit-cold-catalog":"cold_catalog_bytes","limit-evidence":"evidence_estimate","limit-input":"max_input_estimate","limit-model":"max_model_requests","limit-tools":"max_tool_calls","limit-seconds":"deadline_seconds","limit-output":"max_output_estimate","limit-plan-output":"plan_output_estimate"};
-function limitSchema(field) {const schema=configuration.limits_schema.properties[field];return schema?.anyOf ? {...schema.anyOf.find(s=>s.type==="integer"),default:schema.default} : schema;}
+const limitFields = {"limit-recent-turns":"recent_turns","limit-summary-output":"summary_output_tokens","limit-cold-catalog":"cold_catalog_bytes","limit-input":"max_input_estimate","limit-model":"max_model_requests","limit-tools":"max_tool_calls","limit-seconds":"deadline_seconds","limit-output":"max_output_estimate","limit-plan-output":"plan_output_estimate"};
+function limitSchema(field) {const schema=configuration.limits_schema.properties[field];return schema?.anyOf ? {...schema.anyOf.find(s=>s.type==="integer" || s.type==="number"),default:schema.default} : schema;}
 function syncThinkingOptions() {
   const old=$('native-thinking').value;
   const choices=configuration.thinking_options || ['default'];
@@ -84,7 +84,7 @@ function resetLimits() {
     const schema=limitSchema(field), input=$(id);if(!schema) continue;
     input.min=schema.minimum ?? schema.exclusiveMinimum + 0.1;
     const output=['max_output_estimate','plan_output_estimate'].includes(field);
-    input.max=output ? (configuration.model_capabilities?.max_output_tokens ?? '') : (schema.maximum ?? ''); input.title=output?'留空采用自动或通用额度':`默认 ${schema.default}；上限 ${schema.maximum}`; input.step=field === "deadline_seconds" ? "any" : "1";
+    input.max=output ? (configuration.model_capabilities?.max_output_tokens ?? '') : (schema.maximum ?? ''); input.title=field==='deadline_seconds'?'留空不限时；单次请求等待单独设置':output?'留空采用自动或通用额度':`默认 ${schema.default}；上限 ${schema.maximum}`; input.step=field === "deadline_seconds" ? "any" : "1";
     input.value=schema.default ?? '';
   }
   busy();
@@ -96,6 +96,7 @@ function taskLimits() {
   for (const [id,field] of Object.entries(limitFields)) {
     if(field==='max_output_estimate' && $('output-mode').value==='auto') {limits[field]=null;continue;}
     if(field==='plan_output_estimate' && !$(id).value) {limits[field]=null;continue;}
+    if(field==='deadline_seconds' && !$(id).value) {limits[field]=null;continue;}
     const value=Number($(id).value), schema=limitSchema(field);if(!schema) continue;
     const maximum=['max_output_estimate','plan_output_estimate'].includes(field)?configuration.model_capabilities?.max_output_tokens:schema.maximum;
     if (!$(id).value || !Number.isFinite(value) || (maximum!=null && value > maximum) || value <= (schema.exclusiveMinimum ?? -Infinity) || value < (schema.minimum ?? -Infinity) || (field !== "deadline_seconds" && !Number.isInteger(value))) throw new Error("请检查运行设置的数值范围。");

@@ -98,6 +98,7 @@ SCHEMAS = {
     "user/message": UserData,
     "assistant/message": AssistantData,
     "assistant/plan": AssistantData,
+    "assistant/citation_patch": AssistantData,
     "context/summary_response": AssistantData,
     "tool/call": CallData,
     "tool/result": OutcomeData,
@@ -145,7 +146,7 @@ class SessionEvent(BaseModel):
         if schema is None:
             raise ValueError("Unknown session event type")
         schema.model_validate(self.data)
-        expected = {"assistant/plan": {"plan"}, "context/summary_response": {"summary"},
+        expected = {"assistant/plan": {"plan"}, "assistant/citation_patch": {"citation_patch"}, "context/summary_response": {"summary"},
                     "assistant/message": {"answer", "tool_call", "tool_calls"}}.get(self.type)
         if expected and self.data["response"]["kind"] not in expected:
             raise ValueError("Session assistant event kind mismatch")

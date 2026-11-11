@@ -66,6 +66,11 @@ class PreparedCall:
     input_size: int
     output_limit_source: str = "explicit"
     measurement_json: bytes = b"{}"
+    evidence_manifest_json: bytes = b"[]"
+
+    @property
+    def evidence_manifest(self):
+        return json.loads(self.evidence_manifest_json)
 
     @property
     def measurement(self):
@@ -123,7 +128,7 @@ class ProviderAdapter(Protocol):
     model_id: str
     simulated: bool
     format_repair: bool
-    request_timeout: float
+    request_timeout: float  # 网络空闲上限，不是单响应总期限。
 
     @property
     def configuration(self) -> dict: ...

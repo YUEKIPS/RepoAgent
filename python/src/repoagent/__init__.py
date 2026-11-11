@@ -1,4 +1,4 @@
 """RepoAgent 离线原型包；导入包本身不启动命令或解析任务。"""
 
 # 与 pyproject.toml 中的发行版本保持一致。
-__version__ = "1.0.0"
+__version__ = "1.1.0"

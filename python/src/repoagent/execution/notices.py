@@ -62,6 +62,7 @@ def stop_notice(reason, *, finalizing=False):
         "run_record_failed": "执行步骤未能保存，本轮已停止继续请求模型。请检查本地存储。",
         "checkpoint_write_failed": "执行检查点未能保存，已停止后续请求；请检查本地存储。",
         "citation_repair_no_progress": "引用修正出现重复问题且没有新的有效依据，未发布这份候选。可查看未发布草稿。",
+        "citation_patch_invalid": "局部引用修正未通过候选、范围或来源校验，未发布这份候选。",
         "citation_repair_budget": "引用尚未修正完成，本次调用额度已用尽，候选没有作为正式答案发布。",
         "model_usage_unknown": "本次模型请求的用量无法确认，已保留未知记录并停止继续发送；不会自动重发。",
         "model_session_halted": "模型请求状态尚未核清，本轮停止继续发送，避免重复生成。",

@@ -93,7 +93,10 @@ class ModelConfig(StrictModel):
     base_url: str = Field(min_length=1, max_length=1000)
     key_env: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     account_scope: str = Field(default="default", pattern=r"^[A-Za-z0-9_.-]{1,80}$")
-    request_timeout_seconds: float = Field(default=30.0, gt=0, le=180)
+    request_timeout_seconds: float = Field(
+        default=30.0, gt=0, le=180,
+        description="Network read/write/pool inactivity timeout; connect capped at 15 seconds. Not response total time.",
+    )
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     usage_mapping: UsageMapping = Field(default_factory=UsageMapping)
