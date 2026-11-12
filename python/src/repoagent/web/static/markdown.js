@@ -21,8 +21,9 @@
     try { const url = new URL(value); return ["https:","http:"].includes(url.protocol) && !url.username && !url.password ? url.href : null; }
     catch { return null; }
   }
-  function render(text) {
+  function render(text, validation = {}) {
     const body = element("div"); body.className = "markdown-body";
+    const affected = new Set(validation.affected_claim_ids || []), missing = new Set(validation.unvalidated_claim_ids || []);
     if (!root.marked || text.length > 200000) { body.append(element("pre",text)); return body; }
     let count = 0;
     function append(parent, tokens, depth = 0) {
@@ -37,6 +38,16 @@
           case "paragraph": child=element("p"); nested(child); break;
           case "text":
             if (token.tokens) { nested(parent); continue; }
+            if (affected.size) {
+              for (const part of decode(token.text).split(/(\[[A-Za-z0-9_-]+\])/g)) {
+                const id=part.slice(1,-1);
+                if(part.startsWith('[') && part.endsWith(']') && affected.has(id)) {
+                  const mark=element('span',`${part} ⚠`);mark.className='claim-warning';
+                  mark.title=missing.has(id)?'此结论没有通过位置与关联校验的引用':'此结论的部分引用未通过核对';parent.append(mark);
+                } else parent.append(document.createTextNode(part));
+              }
+              continue;
+            }
             child=document.createTextNode(decode(token.text)); break;
           case "escape": child=document.createTextNode(token.text); break;
           case "strong": case "em": case "del": child=element(token.type); nested(child); break;

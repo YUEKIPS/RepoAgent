@@ -4,10 +4,34 @@ import hashlib
 import json
 
 from repoagent.execution.contracts import Answer, Citation, CitationPatch, origin_fields
+from repoagent.execution.prompt_spec import FULL_REWRITE, PATCH_INSTRUCTION
 from repoagent.tools.store import source_lines
 
-FULL_REWRITE = "Rewrite the complete answer, claims and citations. Expand/read missing original evidence if tools remain; otherwise withdraw unsupported statements and explain insufficient evidence. Do not change workspace or guess identity. All candidates are validated again."
 LOCAL_ISSUES = {"citation_range_outside_evidence", "citation_source_mismatch"}
+
+
+class PatchValidationError(ValueError):
+    def __init__(self, code, citation_index=None):
+        self.code, self.citation_index = code, citation_index
+        super().__init__(code)
+
+
+def same_source(a, b):
+    return (origin_fields(a) == origin_fields(b)
+            and (a.repo_id, a.commit, a.path) == (b.repo_id, b.commit, b.path))
+
+
+def patch_constraints(answer, issues, evidence):
+    by_id = {e.evidence_id: e for e in evidence}
+    constraints = []
+    for index in sorted({i["citation_index"] for i in issues if "citation_index" in i}):
+        old = answer.citations[index]
+        anchor = by_id.get(old.evidence_id)
+        constraints.append({"citation_index": index, "claim_ids": old.claim_ids.copy(),
+                            "anchor": anchor.model_dump(exclude={"text"}) if anchor else None,
+                            "allowed_replacements": [e.model_dump(exclude={"text"}) for e in evidence
+                                                     if anchor is not None and same_source(e, anchor)]})
+    return constraints
 
 
 def is_citation_patch(feedback):
@@ -22,7 +46,7 @@ def candidate_revision(answer):
 def full_rewrite_feedback(feedback):
     return {
         k: v for k, v in feedback.items()
-        if k not in {"mode", "candidate_revision"}
+        if k not in {"mode", "candidate_revision", "constraints", "last_rejection"}
     } | {"instruction": FULL_REWRITE}
 
 
@@ -34,35 +58,33 @@ def apply_citation_patch(feedback, patch: CitationPatch, evidence):
         or patch.candidate_revision != feedback["candidate_revision"]
         or candidate_revision(original) != patch.candidate_revision
     ):
-        raise ValueError("citation_patch_candidate_mismatch")
+        raise PatchValidationError("citation_patch_candidate_mismatch")
     if patch.status != "patch":
         return None
     allowed = {i["citation_index"] for i in feedback["issues"]}
     updates = {u.citation_index: u for u in patch.citation_updates}
     if len(updates) != len(patch.citation_updates) or set(updates) != allowed:
-        raise ValueError("citation_patch_indices")
+        raise PatchValidationError("citation_patch_indices")
     by_id = {e.evidence_id: e for e in evidence}
     replacements = {}
     for index, update in updates.items():
         if index >= len(original.citations):
-            raise ValueError("citation_patch_indices")
+            raise PatchValidationError("citation_patch_indices", index)
         old = original.citations[index]
         # 绑定原证据而非候选里可能错误的来源声明，禁止改引其他文件/版本。
         anchor = by_id.get(old.evidence_id)
         if anchor is None:
-            raise ValueError("citation_patch_missing_evidence")
+            raise PatchValidationError("citation_patch_missing_evidence", index)
         references = []
         for ref in update.replacement:
             item = by_id.get(ref.evidence_id)
             if (
                 item is None
-                or origin_fields(item) != origin_fields(anchor)
-                or (item.repo_id, item.commit, item.path)
-                != (anchor.repo_id, anchor.commit, anchor.path)
+                or not same_source(item, anchor)
             ):
-                raise ValueError("citation_patch_source_mismatch")
+                raise PatchValidationError("citation_patch_source_mismatch", index)
             if not item.start_line <= ref.start_line <= ref.end_line <= item.end_line:
-                raise ValueError("citation_patch_range")
+                raise PatchValidationError("citation_patch_range", index)
             references.append(Citation(
                 **item.model_dump(exclude={"text", "start_line", "end_line"}),
                 start_line=ref.start_line, end_line=ref.end_line,
@@ -106,15 +128,10 @@ class RepairPolicy:
             "allowed_evidence": [e.model_dump(exclude={"text"}) for e in evidence],
             "instruction": FULL_REWRITE,
         }
-        if issues and all(i["code"] in LOCAL_ISSUES for i in issues):
+        if issues and len({i.get("citation_index") for i in issues}) <= 40 and all(i["code"] in LOCAL_ISSUES for i in issues):
             feedback.update(mode="citation_patch", candidate_revision=candidate_revision(answer))
-            feedback["instruction"] = (
-                "Return a CitationPatch JSON object, not a rewritten answer. Only replace the indicated original citation indices. "
-                "Preserve all answer text, claims and claim associations. Each replacement must cite actually provided original lines supporting the unchanged claim. "
-                "Split cross-fragment ranges into separate evidence IDs; never silently clip a range to hide missing evidence. "
-                "Use needs_evidence if original source is missing, or needs_answer_revision if the claim/answer must change. "
-                "For those statuses return no updates. Do not invent evidence or identity."
-            )
+            feedback["instruction"] = PATCH_INSTRUCTION
+            feedback["constraints"] = patch_constraints(answer, issues, evidence)
         return feedback
 
 
@@ -132,7 +149,7 @@ def citation_issues(answer, evidence, all_evidence=()):
         if item is None:
             issues.append(issue | {"code": "evidence_not_in_request" if citation.evidence_id in known else "unknown_evidence_id"})
             continue
-        if origin_fields(citation) != origin_fields(item) or any(
+        if not isinstance(citation, Citation) or origin_fields(citation) != origin_fields(item) or any(
             getattr(citation, k) != getattr(item, k) for k in ("repo_id", "commit", "path")
         ):
             issues.append(issue | {"code": "citation_source_mismatch", "allowed": item.model_dump(exclude={"text"})})
@@ -144,5 +161,5 @@ def citation_issues(answer, evidence, all_evidence=()):
     if not evidence and answer.claims:
         issues.append({"code": "claims_without_source_evidence"})
     if (answer.answer_status == "answered" and not ids) or covered != ids:
-        issues.append({"code": "answered_claims_without_citations"})
-    return issues[:40]
+        issues.append({"code": "answered_claims_without_citations", "claim_ids": sorted(ids - covered)})
+    return issues

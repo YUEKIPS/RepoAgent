@@ -178,11 +178,12 @@ class EvidenceManager:
             # Original parents stay unchanged; repeated identical fragments reuse IDs.
             if exact:
                 ids = [exact.evidence_id]
-            elif lines and parent.start_line <= start and start + len(lines) - 1 <= parent.end_line:
+            elif lines:
                 fragment = parent.model_copy(update={"evidence_id": f"E{len(self.state.evidence) + 1}", "start_line": start, "end_line": start + len(lines) - 1, "text": "".join(lines)})
                 self.state.evidence.append(fragment)
                 ids = [fragment.evidence_id]
-                self.trace.append({"event": "evidence_added", "evidence": fragment.model_dump(), "parent_ids": reused})
+                self.trace.append({"event": "evidence_added", "evidence": fragment.model_dump(), "parent_ids": reused,
+                                   "representation": "continuous_reading_view"})
         for segment_start, segment_lines in segments:
             if segment_lines:
                 item = Evidence(

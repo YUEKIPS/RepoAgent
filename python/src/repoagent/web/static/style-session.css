@@ -419,4 +419,5 @@ dialog::backdrop { background:var(--overlay); }
   .repo-row { gap:8px; padding:10px; }
   .inspector { width:100%!important; }
 }
+.claim-warning { text-decoration:underline wavy; text-underline-offset:3px; font-weight:600; }
 @media(prefers-reduced-motion:reduce) { *,*::before,*::after { animation:none!important; transition:none!important; scroll-behavior:auto!important; } }

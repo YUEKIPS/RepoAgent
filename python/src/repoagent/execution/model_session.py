@@ -6,7 +6,7 @@ import time
 from dataclasses import replace
 from uuid import uuid4
 
-from repoagent.execution.contracts import ModelCallRecord, Usage
+from repoagent.execution.contracts import ModelCallRecord, ModelRequest, Usage
 from repoagent.execution.limits import Limits
 from repoagent.execution.meter import RequestMeter
 from repoagent.execution.usage_store import UsageStore
@@ -160,6 +160,7 @@ class ModelSession:
             raise ModelServiceError(code="model_configuration_mismatch")
         policy = getattr(self.adapter, "cache_policy", None)
         positions = None
+        projection_metadata = None
         if policy and policy.enabled:
             from repoagent.models.cache_context import render
             payload, candidate = render(json.loads(prepared.payload), request, tuple(self._continuations), self._cache_context, policy)
@@ -167,12 +168,15 @@ class ModelSession:
             prepared = replace(prepared, payload=wire, input_size=len(wire))
             self._cache_candidates[prepared.call_id] = candidate
             if policy.evidence and candidate:
-                positions = candidate["evidence_positions"]
+                positions = candidate.get("evidence_positions")
+            projection_metadata = candidate.get("projection_metadata")
         from repoagent.models.evidence_view import manifest_for
         manifest = manifest_for(prepared, request, positions, simulated=self.simulated)
         prepared = replace(prepared, evidence_manifest_json=json.dumps(manifest, sort_keys=True).encode())
         capabilities = getattr(getattr(self.adapter, "config", None), "capabilities", None)
         measured = RequestMeter().measure(prepared, capabilities, self.limits, self.token_counter, self.meter_identity)
+        if projection_metadata:
+            measured["cache_projection"] = projection_metadata
         prepared = replace(prepared, measurement_json=json.dumps(measured, sort_keys=True).encode())
         self._issued[prepared.call_id] = prepared
         self.guard()
@@ -269,6 +273,7 @@ class ModelSession:
         response = None
         try:
             self._validate(prepared)
+            ModelRequest.model_validate_json(prepared.request_json)
             self.guard()
             if reservation is not None and (
                 self.simulated or self._tickets.get(prepared.call_id) != reservation
@@ -393,7 +398,8 @@ class ModelSession:
                 else:
                     self._continuations.append(state)
             if record.dispatch_state != "not_sent" and record.input_tokens is not None:
-                self._cache_context = self._cache_candidates.pop(prepared.call_id, {})
+                candidate = self._cache_candidates.pop(prepared.call_id, {})
+                self._cache_context = candidate.get("resume_context", candidate)
             else:
                 self._cache_candidates.pop(prepared.call_id, None)
             self.refresh_usage()
@@ -460,6 +466,14 @@ class ModelSession:
                 "continuations": [s.decode("utf-8") for s in self._continuations],
                 "cache_context": json.loads(json.dumps(self._cache_context)),
                 "halted": self._halted}
+
+
+    def reset_protocol(self):
+        """Start a fresh projection without inventing tool results or resetting usage."""
+        self.ensure_healthy()
+        self._continuations = []
+        self._cache_context = {}
+        self._cache_candidates.clear()
 
     def restore_state(self, state):
         if state["generation_id"] != self.generation_id or state["halted"] or state.get("meter_identity") != self.meter_identity:

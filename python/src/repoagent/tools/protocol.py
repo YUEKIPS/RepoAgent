@@ -1,4 +1,4 @@
-"""四工具的版本化协议：严格参数模型、JSON schema、固定白名单和错误分类。
+"""注册工具的版本化协议：严格参数模型、JSON schema、固定白名单和错误分类。
 
 模型只能请求显式允许的函数；可修正参数错误回到循环，完整性/存储故障立即停止。
 """
@@ -10,6 +10,7 @@ from jsonschema import ValidationError as SchemaError
 from pydantic import Field, ValidationError, model_validator
 
 from repoagent.execution.contracts import StrictModel, ToolCall, ToolError, ToolOutcome
+from repoagent.execution.investigation import UpdateTaskArgs, update_task
 from repoagent.repositories.github import GitHubError
 from repoagent.repositories.text import TEXT_ERRORS
 from repoagent.repositories.tools import CursorStale
@@ -26,7 +27,7 @@ from repoagent.tools.store import (
     ToolUnreadablePathError,
 )
 
-SCHEMA_VERSION = "registered-tools-v13-context"
+SCHEMA_VERSION = "registered-tools-v16-guidance-placement"
 
 
 # 分页参数：limit限制每页项数，cursor为下一页偏移，不接受bool冒充整数。
@@ -95,6 +96,8 @@ class ReadArgs(StrictModel):
     start_line: int = Field(default=1, ge=1, le=2**31 - 1)
     end_line: int | None = Field(default=None, ge=1, le=2**31 - 1)
     start_column: int = Field(default=0, ge=0, le=2**31 - 1)
+    symbol: str | None = Field(default=None, min_length=1, max_length=512)
+    verification_of: str | None = Field(default=None, min_length=1, max_length=80)
 
     @model_validator(mode="after")
     def safe(self):
@@ -102,6 +105,17 @@ class ReadArgs(StrictModel):
         safe_relative(self.path)
         if self.end_line is not None and self.end_line < self.start_line:
             raise ValueError("Reversed range")
+        if self.symbol is not None and (self.start_line != 1 or self.end_line is not None or self.start_column):
+            raise ValueError("Choose a symbol or an explicit range")
+        return self
+
+
+class OutlineArgs(PageArgs):
+    path: str
+
+    @model_validator(mode="after")
+    def safe(self):
+        safe_relative(self.path)
         return self
 
 
@@ -122,18 +136,22 @@ ARGUMENTS = {
     "read_file": ReadArgs,
     "get_symbol": SymbolArgs,
     "expand_evidence": ExpandArgs,
+    "outline_file": OutlineArgs,
+    "update_task": UpdateTaskArgs,
 }
 DESCRIPTIONS = {
+    "update_task": "Optional task notebook for multi-part work. Upsert objective IDs/statuses and one canonical fact per fact_id, including conditions and registered evidence_ids. Inference/background must be labeled. Notes are NOT source evidence or proof. Update when it helps track coverage or resolve a specific uncertainty; simple answers need no notebook call. Goal/repository permissions cannot change.",
+    "outline_file": "File declaration outline and total lines, navigation only. Shows indexed types/functions/methods and their ranges; text_only is not an exhaustive outline. Use read_file for source. Paginate next_cursor.",
     "expand_evidence": "Request original evidence_ids from this task for the next model input. Already visible IDs are idempotent; cold IDs are restored locally. Or supply only catalog_cursor to page the non-citable catalog. Only IDs in the actual next input's citation_policy are citable. On context_capacity request fewer IDs, or use read_file with a smaller whole-line range to create a new immutable fragment. Does not fetch another repository or version.",
     "list_directory": "列当前快照目录；排除文件可见不代表可读。按next_cursor分页。",
-    "search_code": "Literal search: text=source text (case-preserving matches preferred), path=file path, symbol=indexed type/method identifier (not fields). Multiple queries are merged round-robin by their own relevance. Use text for field names/annotations. No matches do not prove absence; paginate with next_cursor.",
-    "read_file": "只读原文，最多200行/16KiB。按continuation行列续读；半行不提供引用。",
+    "search_code": "Literal search: text=source text (case-preserving matches preferred), path=file path, symbol=indexed type/method identifier (not fields). Multiple queries are merged round-robin by their own relevance. Use text for field names/annotations. No matches do not prove absence; paginate with next_cursor. At most 3 queries per call; no path filter parameter. Respect returned size and pagination boundaries.",
+    "read_file": "只读原文，最多200行/16KiB。省略end_line从起点读至容量边界；或指定symbol读取该文件唯一声明。range_complete仅表示请求范围完成，at_eof仅表示到了文件尾，不等于已读整个文件或必要结构。关注总行数和截断原因；按continuation续本次范围，next_file_range提示文件后续；半行不可引。verification_of可关联本次待核事项。",
     "get_symbol": "Exact bare symbol name (e.g. a type name, no 'class ' prefix). Omit path for global lookup; optional path is an EXACT FILE, never a directory. Returns candidate locations, not source text or a call graph.",
 }
 
 
 def tool_schemas(workspace=False) -> list[dict]:
-    """返回四个工具的名称、描述及Pydantic参数schema；版本由SCHEMA_VERSION记录。"""
+    """从实际参数能力生成路由说明；任务级工具不承载仓库选择参数。"""
     schemas = [
         {
             "name": name,
@@ -144,14 +162,14 @@ def tool_schemas(workspace=False) -> list[dict]:
     ]
     for schema in schemas:
         params = schema["parameters"]
-        if workspace:
+        if workspace and "repo_id" in params["properties"]:
             schema["description"] += (
                 " Workspace-bound: repo_id selects an allowed repository; omit it only for joint search/get_symbol. Copy repo_id from hits into read_file."
                 " For github_lazy sources: directories and path search use the complete fixed catalog; text/symbol/get_symbol use fetched indexed files only. read_file fetches an allowed missing file within the shared budget. A miss is not proof of absence. On cursor_stale restart at cursor=0."
             )
-            if schema["name"] in {"read_file", "list_directory"}:
+            if schema["name"] in {"read_file", "list_directory", "outline_file"}:
                 params.setdefault("required", []).append("repo_id")
-        else:
+        elif not workspace:
             params["properties"].pop("repo_id", None)
     return schemas
 
@@ -184,7 +202,15 @@ def builtin_registry(tools, evidence=None):
         return data
     handlers = {"list_directory": tools.list_directory, "search_code": tools.search_code,
                 "read_file": tools.read_file, "get_symbol": tools.get_symbol}
+    if hasattr(tools, "outline_file"):
+        handlers["outline_file"] = tools.outline_file
     if evidence:
+        def task_update(**params):
+            try:
+                return update_task(evidence.state, evidence.state.evidence, **params)
+            except ValueError:
+                raise ToolParameterError("Invalid task notes or evidence references") from None
+        handlers["update_task"] = task_update
         def expand(**params):
             try:
                 return evidence.expand(**params)
@@ -267,6 +293,7 @@ class Dispatcher:
                 "credential_rejected",
                 "cancelled",
                 "repository_disk_limit",
+                "source_retrieval_restricted",
                 "unsupported_text_encoding",
             }
             return failed(error.code, recoverable)

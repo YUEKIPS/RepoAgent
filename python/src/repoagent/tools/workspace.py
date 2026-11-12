@@ -5,25 +5,43 @@ import hashlib
 import json
 
 from repoagent.execution.contracts import Workspace, origin_fields
-from repoagent.repositories.sources import GitHubSource, descriptor
+from repoagent.repositories.github import GitHubError
+from repoagent.repositories.sources import (
+    GitHubSource,
+    SnapshotLease,
+    descriptor,
+    source_text,
+)
 from repoagent.repositories.tools import CursorStale, RepositoryTools, tool_for
 from repoagent.tools.store import (
     MAX_RESULT_BYTES,
     ToolParameterError,
     json_size,
+    read_text_block,
+    safe_relative,
 )
+
+SOURCE_RESTRICTION_ERRORS = {
+    "connection_or_tls_failed", "dns_timeout", "request_timeout", "rate_limited",
+    "github_connect_timeout", "github_tls_timeout", "github_headers_timeout", "github_read_timeout",
+    "github_connection_failed", "github_incomplete_response", "network_time_limit", "network_byte_limit",
+    "network_request_limit", "new_file_limit", "credential_rejected", "access_denied",
+    "cache_full_with_protected_content", "repository_disk_limit",
+}
 
 
 class WorkspaceTools:
     allows_routing = True
 
     def __init__(self, snapshots, binding: Workspace):
-        self.roots = dict(snapshots)
-        self.manifests = {name: descriptor(path) for name, path in snapshots.items()}
+        self.roots = {name: source if isinstance(source, (GitHubSource, SnapshotLease)) else SnapshotLease.capture(source)
+                      for name, source in snapshots.items()}
+        self.manifests = {name: descriptor(path) for name, path in self.roots.items()}
         if Workspace.bind(self.manifests) != binding:
             raise ValueError("Workspace snapshot binding mismatch")
         self.binding = binding
-        self.tools = {name: tool_for(path) for name, path in snapshots.items()}
+        self.tools = {name: tool_for(path) for name, path in self.roots.items()}
+        self.restrictions = {}
 
     def generations(self):
         return {
@@ -56,7 +74,42 @@ class WorkspaceTools:
         return dict(repo_id=repo_id, commit=manifest.commit, **origin_fields(manifest))
 
     def read_file(self, *, repo_id=None, **params):
-        return self._tool(repo_id).read_file(**params) | self._identity(repo_id)
+        tool = self._tool(repo_id)
+        symbol = params.pop("symbol", None)
+        params.pop("verification_of", None)
+        if symbol is not None:
+            candidates = tool.get_symbol(symbol, path=params["path"], limit=100)["items"]
+            if len(candidates) != 1:
+                raise ToolParameterError("Symbol must identify one indexed declaration")
+            params.update(start_line=candidates[0]["start_line"], end_line=candidates[0]["end_line"], start_column=0)
+        source = self.roots[repo_id]
+        if isinstance(source, GitHubSource) and (repo_id in self.restrictions or "*" in self.restrictions):
+            safe_relative(params["path"])
+            try:
+                text = source_text(source, params["path"])
+            except GitHubError as error:
+                if error.code == "retained_source_unavailable":
+                    raise GitHubError("source_retrieval_restricted") from None
+                raise
+            return read_text_block(self._identity(repo_id), text=text, **params)
+        return tool.read_file(**params) | self._identity(repo_id)
+
+    def outline_file(self, *, repo_id=None, **params):
+        if isinstance(self.roots.get(repo_id), GitHubSource) and (repo_id in self.restrictions or "*" in self.restrictions):
+            params["cached_only"] = True
+        return self._tool(repo_id).outline_file(**params) | self._identity(repo_id)
+
+    def capabilities(self):
+        result = {}
+        for name, source in self.roots.items():
+            item = descriptor(source)
+            remote = isinstance(source, GitHubSource)
+            result[name] = {"source_kind": item.source_kind, "directory": "fixed_catalog",
+                            "text_search": "cached_only" if remote else "prepared_readable_files",
+                            "symbols": "cached_declarations" if remote else "indexed_declarations",
+                            "coverage": item.coverage, "fetch_allowed_files": remote and name not in self.restrictions and "*" not in self.restrictions,
+                            "declaration_kinds": "types/functions/methods as supported by language index"}
+        return result
 
     def list_directory(self, *, repo_id=None, **params):
         if not isinstance(params.get("cursor", 0), int):
@@ -147,8 +200,10 @@ class WorkspaceTools:
                 raise ToolParameterError(
                     "Cursor belongs to another query/workspace"
                 ) from None
-        pages = {
-            n: getattr(self.tools[n], method)(
+        pages = {}
+        for n in names:
+            try:
+                pages[n] = getattr(self.tools[n], method)(
                 **params,
                 limit=limit,
                 cursor=(
@@ -156,15 +211,20 @@ class WorkspaceTools:
                     if isinstance(self.tools[n], RepositoryTools)
                     else offsets[n]
                 ),
-            )
-            for n in names
-        }
+                )
+            except GitHubError as error:
+                if error.code not in SOURCE_RESTRICTION_ERRORS:
+                    raise
+                self.restrictions[n] = error.code
+                pages[n] = {"items": [], "truncated": False,
+                            "limitations": [f"source retrieval restricted: {error.code}; no matches is not proof of absence"]}
         result = {
             "workspace_version": self.binding.version,
             "items": [],
             "limitations": [],
             "truncated": False,
             "next_cursor": None,
+            "source_restrictions": dict(self.restrictions),
         }
         for n, page in pages.items():
             result["limitations"].extend(

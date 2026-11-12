@@ -56,12 +56,15 @@ class SnapshotTools:
 
     def __init__(self, snapshot: Path):
         """绑定snapshot绝对路径并复验完整性；连接在调用时按需创建，不持有可写索引。"""
-        self.root = snapshot.absolute()
-        verify_snapshot(self.root)
+        self._source = snapshot if hasattr(snapshot, "index_data") else None
+        self.root = snapshot.root if self._source else snapshot.absolute()
+        self._index_data = snapshot.index_data if self._source else None
+        if self._source is None:
+            verify_snapshot(self.root)
 
     def _context(self):
         """复验快照并返回(manifest, 公共元数据字典)，PARTIAL时持续附覆盖限制。"""
-        manifest = verify_snapshot(self.root)
+        manifest = self._source.descriptor() if self._source else verify_snapshot(self.root)
         base = {
             "snapshot_id": manifest.snapshot_id,
             "commit": manifest.commit,
@@ -78,6 +81,12 @@ class SnapshotTools:
     def _connect(self):
         # mode=ro 禁止工具修改索引；URI 编码处理空格、# 等路径字符。
         """返回mode=ro的SQLite连接，调用者负责关闭；URI编码避免空格/#改变路径含义。"""
+        if self._index_data is not None:
+            db = sqlite3.connect(":memory:")
+            db.deserialize(self._index_data)
+            db.execute("PRAGMA query_only=ON")
+            db.row_factory = sqlite3.Row
+            return db
         uri = (
             "file:"
             + quote((self.root / "index.sqlite3").as_posix(), safe="/:")
@@ -334,6 +343,8 @@ class SnapshotTools:
         start_line: int = 1,
         end_line: int | None = None,
         start_column: int = 0,
+        symbol: str | None = None,
+        verification_of: str | None = None,
     ) -> dict:
         """读取path的start_line～end_line原文，返回范围、文本及continuation。
 
@@ -341,6 +352,11 @@ class SnapshotTools:
         按UTF-8边界截断避免坏编码，未读范围显式续读；不在覆盖内或范围非法时拒绝。
         """
         safe_relative(path)
+        if symbol is not None:
+            candidates = self.get_symbol(symbol, path=path, limit=100)["items"]
+            if len(candidates) != 1:
+                raise ToolParameterError("Symbol must identify one indexed declaration")
+            start_line, end_line, start_column = candidates[0]["start_line"], candidates[0]["end_line"], 0
         integer(start_line, 1, 2**31 - 1)
         integer(start_column, 0, 2**31 - 1)
         if end_line is not None:
@@ -352,6 +368,8 @@ class SnapshotTools:
             raise ToolUnreadablePathError(
                 "File is not readable within indexed coverage"
             )
+        if self._source is not None:
+            self._source.read_bytes(path)
         with closing(self._connect()) as db:
             row = db.execute("SELECT text FROM files WHERE path=?", (path,)).fetchone()
         if row is None:
@@ -359,6 +377,21 @@ class SnapshotTools:
         return read_text_block(
             base, path, row["text"], start_line, end_line, start_column
         )
+
+    def outline_file(self, path, limit=50, cursor=0):
+        safe_relative(path)
+        manifest, base = self._context()
+        entry = next((f for f in manifest.files if f.path == path and f.status in READABLE), None)
+        if entry is None:
+            raise ToolUnreadablePathError("File is not readable within indexed coverage")
+        with closing(self._connect()) as db:
+            row = db.execute("SELECT text FROM files WHERE path=?", (path,)).fetchone()
+            rows = [dict(r) for r in db.execute("SELECT * FROM symbols WHERE path=? ORDER BY start_line,end_line", (path,))]
+        if row is None:
+            raise ToolUnreadablePathError("File text unavailable")
+        return self._page(base | {"path": path, "file_total_lines": len(source_lines(row["text"])),
+                                 "declaration_coverage": "indexed" if entry.status == "parsed" else "text_only",
+                                 "navigation_only": True}, rows, limit, cursor)
 
 
 def read_text_block(base, path, text, start_line=1, end_line=None, start_column=0):
@@ -368,6 +401,12 @@ def read_text_block(base, path, text, start_line=1, end_line=None, start_column=
     if end_line is not None:
         integer(end_line, start_line, 2**31 - 1)
     lines = source_lines(text)
+    if not lines and start_line == 1 and start_column == 0:
+        return base | {"path": path, "start_line": 1, "start_column": 0, "end_line": 0,
+                       "text": "", "file_empty": True, "file_total_lines": 0, "at_eof": True,
+                       "requested_range": {"start_line": start_line, "end_line": end_line, "start_column": start_column},
+                       "returned_range": None, "range_complete": True, "truncated": False,
+                       "truncation_reason": None, "continuation": None, "next_file_range": None}
     if not lines or start_line > len(lines):
         raise ToolParameterError("Start line outside file")
     if start_column >= len(lines[start_line - 1]) and start_column != 0:
@@ -382,6 +421,14 @@ def read_text_block(base, path, text, start_line=1, end_line=None, start_column=
         "text": "",
         "truncated": False,
         "continuation": None,
+        "file_total_lines": len(lines),
+        "file_empty": False,
+        "at_eof": False,
+        "requested_range": {"start_line": start_line, "end_line": end_line, "start_column": start_column},
+        "returned_range": None,
+        "range_complete": False,
+        "truncation_reason": None,
+        "next_file_range": None,
     }
     # 支持文本控制字符只有tab/CR/LF，JSON转义最多放大两倍。
     # 预留元数据空间，确保整个返回不超过32KiB，原文不超过16KiB。
@@ -395,6 +442,7 @@ def read_text_block(base, path, text, start_line=1, end_line=None, start_column=
         piece = raw[:remaining].decode("utf-8", errors="ignore")
         if not piece:
             result["continuation"] = {"start_line": number, "start_column": column}
+            result["truncation_reason"] = "byte_limit"
             break
         result["text"] += piece
         result["end_line"] = number
@@ -404,11 +452,19 @@ def read_text_block(base, path, text, start_line=1, end_line=None, start_column=
                 "start_line": number,
                 "start_column": column + len(piece),
             }
+            result["truncation_reason"] = "byte_limit"
             break
     else:
         if last < requested_end:
             result["continuation"] = {"start_line": last + 1, "start_column": 0}
+            result["truncation_reason"] = "line_limit"
     result["truncated"] = result["continuation"] is not None
+    result["range_complete"] = not result["truncated"]
+    partial = result["continuation"] and result["continuation"]["start_column"] > 0
+    result["at_eof"] = result["end_line"] == len(lines) and not partial and not result["truncated"]
+    result["returned_range"] = {"start_line": start_line, "end_line": result["end_line"], "start_column": start_column}
+    if not result["at_eof"]:
+        result["next_file_range"] = result["continuation"] or {"start_line": result["end_line"] + 1, "start_column": 0}
     if json_size(result) > MAX_RESULT_BYTES:
         raise ValueError("Tool response limit exceeded")
     return result

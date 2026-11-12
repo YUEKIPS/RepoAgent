@@ -31,13 +31,17 @@ class Limits(StrictModel):
     cold_catalog_bytes: int = Field(default=6000, ge=256, le=40000)
     final_request_reserve: int = Field(default=2, ge=1, le=5)
     stream: bool = True
+    content_review_enabled: bool = True
+    content_review_output_tokens: int = Field(default=4096, ge=512, le=8192)
+    content_review_followup_models: int = Field(default=2, ge=0, le=4)
+    content_review_followup_tools: int = Field(default=4, ge=0, le=8)
 
     @model_validator(mode="after")
     def valid_function_limits(self):
         if self.prune_head_chars + self.prune_tail_chars + 43 > self.prune_threshold_chars:
             raise ValueError("Head/tail preview must fit its threshold")
         if any(
-            k not in {"plan", "act", "answer", "summary"} or type(v) is not int or v < 1
+            k not in {"plan", "act", "answer", "summary", "review"} or type(v) is not int or v < 1
             for k, v in self.function_output_limits.items()
         ):
             raise ValueError(
@@ -49,6 +53,8 @@ class Limits(StrictModel):
         """阶段覆盖→通用请求→功能配置→自动；act也可能直接给出最终回答。"""
         if stage == "summary":
             return self.summary_output_tokens
+        if stage == "review":
+            return min(self.content_review_output_tokens, self.max_output_estimate) if self.max_output_estimate is not None else self.content_review_output_tokens
         if stage == "plan" and self.plan_output_estimate is not None:
             return self.plan_output_estimate
         if self.max_output_estimate is not None:

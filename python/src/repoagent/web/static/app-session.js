@@ -50,7 +50,7 @@ function updateRunningCard(card,job) {
   announce(job.cancel_requested?'正在停止任务':runningText(job));
 }
 function cardVersion(job) {
-  if(job.state!=='running')return JSON.stringify([job.state,job.question,job.mode,job.simulated,job.workspace,job.context,job.result?.answer,job.result?.execution_status,job.result?.answer_status,job.result?.citations,job.result?.conversation_context,job.result?.notices,job.artifact_error,job.publication_status,job.error,unpublishedDraft(job),completedWork(job)]);
+  if(job.state!=='running')return JSON.stringify([job.state,job.question,job.mode,job.simulated,job.workspace,job.context,job.result?.answer,job.result?.execution_status,job.result?.answer_status,job.result?.citations,job.result?.citation_diagnostics,job.result?.affected_claim_ids,job.result?.conversation_context,job.result?.notices,job.artifact_error,job.publication_status,job.error,unpublishedDraft(job),completedWork(job)]);
   return JSON.stringify([job.state,job.question,job.mode,job.simulated,job.workspace,job.context]);
 }
 
@@ -232,12 +232,18 @@ function renderJobs() {
     card.id=`answer-${job.id}`;
     const result = job.result, label = node("div", undefined, "answer-label");
     const stateLabels={SUCCEEDED:"已完成",FAILED:"执行失败",CANCELLED:"已停止",BUDGET_EXCEEDED:"达到执行限制"};
-    label.append(node("span", `RepoAgent${job.simulated ? " · 模拟" : ""}${job.mode==='baseline' ? " · Baseline" : ""}`), node("span", job.state === "running" ? (job.cancel_requested ? "正在停止…" : "分析中…") : stateLabels[result?.execution_status] || "执行失败"));
+    label.append(node("span", `RepoAgent${job.simulated ? " · 模拟" : ""}${job.mode==='baseline' ? " · Baseline" : ""}`), node("span", job.state === "running" ? (job.cancel_requested ? "正在停止…" : "分析中…") : result?.citation_diagnostics?.length ? '已完成 · 引用待核对' : stateLabels[result?.execution_status] || "执行失败"));
     const progressText=runningText(job);
     const text=result?.answer || (job.state === "running" ? progressText : failureText(job));
     const body=node("div",undefined,"answer-body");
-    if(result?.answer && globalThis.RepoMarkdown) body.append(RepoMarkdown.render(text));else body.textContent=text;
+    if(result?.answer && globalThis.RepoMarkdown) body.append(RepoMarkdown.render(text,result));else body.textContent=text;
     card.append(label,body);
+    if(result?.citation_diagnostics?.length) {
+      const warning=node('div',undefined,'limitation');
+      warning.append(node('p','正文已保留，部分引用未通过核对；这不代表相关结论已获证实。'));
+      for(const claim of result.claims || []) if((result.affected_claim_ids || []).includes(claim.claim_id)) warning.append(node('p',`[${claim.claim_id}] ${(result.unvalidated_claim_ids || []).includes(claim.claim_id)?'缺少已核对引用':'部分引用有问题'} · ${claim.text}`));
+      card.append(warning);
+    }
     if(job.state==='running') {
       const draft=liveDrafts.get(job.id);if(draft?.text) body.textContent='生成中 · 尚未完成引用校验\n\n'+draft.text;
       updateRunningCard(card,job);followStream(job.id);

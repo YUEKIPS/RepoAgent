@@ -246,9 +246,11 @@ def create_server(service, port=8765):
                         and parts[3] == "source"
                     ):
                         q = parse_qs(url.query, strict_parsing=True)
-                        if set(q) - {"line", "column"} or any(
+                        if set(q) - {"line", "column", "context"} or any(
                             len(v) != 1 for v in q.values()
                         ):
+                            raise ServiceError("invalid_cursor")
+                        if q.get("context", ["0"])[0] not in {"0", "1"}:
                             raise ServiceError("invalid_cursor")
                         start = int(q["line"][0]) if "line" in q else None
                         return self.reply(
@@ -258,6 +260,7 @@ def create_server(service, port=8765):
                                 int(parts[4]),
                                 start,
                                 int(q.get("column", ["0"])[0]),
+                                q.get("context", ["0"])[0] == "1",
                             ),
                         )
                 self.reply(404, {"error": "not_found"})

@@ -17,29 +17,34 @@ function render(job) {
     $("task-meta").append(node("dt","最近压缩"),node("dd",rebuilds.length ? (rebuilds.at(-1).reason==='request_pressure' ? '完整输入接近容量限制' : '主动压缩') : '未触发'));
   }
   for (const [key,value] of [["任务", job.id],["仓库版本", job.workspace ? workspaceLabel(job.workspace) : `${job.repository} @ ${job.commit}`],["执行模式",job.mode],["模型来源",job.simulated ? "模拟" : "真实模型"],["任务状态", job.result ? `${job.result.execution_status} / ${job.result.answer_status || "无回答"}` : job.state],["停止原因", job.result?.stop_reason || job.error?.code || "等待完成"],["记录保存", job.artifact_saved ? "已保存" : job.state === "running" ? "执行中" : "请导出保留"]]) $("task-meta").append(node("dt",key),node("dd",value));
-  const nextSourceVersion=JSON.stringify([job.id,job.result?.citations,job.result?.original_citations,job.result?.claims]);
+  const nextSourceVersion=JSON.stringify([job.id,job.result?.citations,job.result?.citation_contexts,job.result?.citation_diagnostics,job.result?.claims]);
   if(nextSourceVersion!==sourceVersion) {
   sourceVersion=nextSourceVersion;
   $("sources").replaceChildren();
   (job.result?.citations || []).forEach((citation, index) => {
     const box = node("div", undefined, "source-card"), button = node("button", `${citation.evidence_id} · ${citation.repo_id ? citation.repo_id+" / " : ""}${citation.path}:${citation.start_line}–${citation.end_line}`), caption = node("div", `结论 ${citation.claim_ids.join(", ")} · ${citation.commit}${citation.snapshot_id ? " · 快照 "+citation.snapshot_id : ""}`, "source-caption");
-    const original=job.result.original_citations?.[index] || citation;
-    box.append(node("p",`模型原引用：${original.start_line}–${original.end_line}；展开上下文：${citation.start_line}–${citation.end_line}`,"source-caption"));
+    const context=job.result.citation_contexts?.[index];
+    box.append(node("p",`精确引用：${citation.start_line}–${citation.end_line}${context ? `；可展开已读上下文：${context.start_line}–${context.end_line}` : ''}`,"source-caption"));
+    const expand=node('button','展开已读上下文');expand.type='button';expand.hidden=!context;
     const code = node("pre"); code.hidden = true; const next = node("button", "继续读取"); next.hidden=true; let cursor;
+    let contextMode=false;
     async function read() {
       $("inspector-error").textContent="";
       button.disabled=true; next.disabled=true;
-      try { const query = cursor ? `?line=${cursor.start_line}&column=${cursor.start_column}` : ""; const source = await api(`/api/tasks/${job.id}/source/${index}${query}`);
+      try { const params=[];if(cursor)params.push(`line=${cursor.start_line}`,`column=${cursor.start_column}`);if(contextMode)params.push('context=1');const query=params.length?'?'+params.join('&'):''; const source = await api(`/api/tasks/${job.id}/source/${index}${query}`);
         if (!cursor) code.textContent = "";
         const lines=source.text.split("\n"); if(lines.at(-1)==="") lines.pop();
         code.textContent += lines.map((line,offset)=>`${source.start_line+offset}${offset===0 && source.start_column ? ":"+source.start_column : ""} │ ${line}`).join("\n")+"\n";
         code.hidden=false; cursor=source.continuation; next.hidden=!cursor;
       } catch(e) {showError(e);} finally {button.disabled=false;next.disabled=false;}
     }
-    button.addEventListener("click", () => {cursor=null;read();}); next.addEventListener("click", read); box.append(button, caption, code, next); $("sources").append(box);
+    button.addEventListener("click", () => {cursor=null;contextMode=false;read();});expand.addEventListener('click',()=>{cursor=null;contextMode=true;read();}); next.addEventListener("click", read); box.append(button, caption, expand, code, next); $("sources").append(box);
   });
   if (!job.result?.citations?.length) $("sources").append(node("p", "当前没有已发布引用。失败或证据不足不等同于正确拒答。"));
-  for (const claim of job.result?.claims || []) $("sources").append(node("p", `${claim.claim_id} · ${claim.text}`));
+  for (const issue of job.result?.citation_diagnostics || []) {
+    const box=node('div',undefined,'source-card');box.append(node('p',`待核对 · ${issue.citation_index == null ? '结论关联' : '原引用 '+(issue.citation_index+1)} · ${(issue.claim_ids || []).join(', ')}`),node('pre',JSON.stringify(issue,null,2)));$('sources').append(box);
+  }
+  for (const claim of job.result?.claims || []) $("sources").append(node("p", `${claim.claim_id} · ${(job.result.unvalidated_claim_ids || []).includes(claim.claim_id)?'未验证 · ':''}${claim.text}`));
   }
   $("trace").replaceChildren(node("p", "以下为执行完成后的记录。模型请求、工具动作及返回内容属于待分析数据。"));
   const notices=noticeItems(job.result);

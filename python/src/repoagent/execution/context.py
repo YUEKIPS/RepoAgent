@@ -5,9 +5,9 @@ This policy has no authority to send requests or alter the cumulative source sta
 
 from dataclasses import dataclass
 
-from repoagent.execution.contracts import ModelRequest
+from repoagent.execution.contracts import Answer, ModelRequest
 from repoagent.execution.prompts import request_instruction
-from repoagent.execution.repair import is_citation_patch
+from repoagent.execution.repair import is_citation_patch, patch_constraints
 from repoagent.tools.protocol import tool_schemas
 
 
@@ -44,6 +44,11 @@ class ContextBuilder:
         registry=None,
         conversation_session=None,
         pressure=False,
+        force_no_tools=False,
+        minimal=False,
+        source_restrictions=None,
+        review_input=None,
+        source_capabilities=None,
     ):
         instruction, guidance, can_use_tools = request_instruction(
             stage,
@@ -55,6 +60,9 @@ class ContextBuilder:
             source_failure,
             repair_notice,
         )
+        if stage == "review":
+            # Completed repairs are a different protocol and may contain an older candidate.
+            repair_feedback = None
         selected = evidence_manager.select(selection_query or query.question) if evidence_manager else state.evidence
         patch_mode = is_citation_patch(repair_feedback)
         if patch_mode:
@@ -65,18 +73,28 @@ class ContextBuilder:
                 (e.repo_id, e.snapshot_id, e.source_version_id, e.commit, e.path) ==
                 (a.repo_id, a.snapshot_id, a.source_version_id, a.commit, a.path) for a in anchors)]
             can_use_tools = False
+            repair_feedback = dict(repair_feedback)
+            repair_feedback["constraints"] = patch_constraints(Answer.model_validate(repair_feedback["candidate"]), repair_feedback["issues"], selected)
+        if force_no_tools or minimal:
+            can_use_tools = False
         message = ModelRequest(
+            source_capabilities=source_capabilities or {},
+            investigation=state.investigation.model_dump(),
+            review_input=review_input,
             evidence_namespace=session.task_id,
             evidence_view_revision=evidence_manager.revision + int([e.evidence_id for e in selected] != evidence_manager.active_ids) if evidence_manager else 0,
             evidence_rebase=pressure,
-            navigation_hints=navigation_hints,
+            force_no_tools=force_no_tools or minimal,
+            retrieval_stop_reason=finalization_reason,
+            source_restrictions=source_restrictions or {},
+            navigation_hints=[] if minimal else navigation_hints,
             stage=stage,
             instruction=instruction,
-            query=query,
+            query=query.model_copy(update={"conversation": None}) if minimal else query,
             evidence=selected,
             cold_evidence=evidence_manager.catalog(active_ids=[e.evidence_id for e in selected]) if evidence_manager else [],
             repair_feedback=repair_feedback,
-            stream=limits.stream and stage != "plan" and session.on_delta is not None and not patch_mode,
+            stream=limits.stream and stage in {"act", "answer"} and session.on_delta is not None and not patch_mode,
             available_tools=(registry.schemas() if registry else tool_schemas(workspace=True)) if can_use_tools else [],
             observations=[
                 o
@@ -90,7 +108,7 @@ class ContextBuilder:
             remaining_tool_calls=limits.max_tool_calls - usage.tool_calls,
         ).model_copy(deep=True)
         message.cold_evidence_next_cursor = evidence_manager.catalog_next_cursor if evidence_manager else None
-        if conversation_session and not patch_mode:
+        if conversation_session and not patch_mode and not minimal:
             message.runtime_memory = conversation_session.runtime_memory(state.run_id)
             message.session_messages = conversation_session.prior_tool_messages(state.run_id)
         if pressure and registry:
@@ -110,6 +128,33 @@ class ContextBuilder:
             threshold = measured.get("trigger_tokens")
             return (bool(threshold and measured["estimated_input_tokens"] >= threshold * .9)
                     or prepared_call.input_size > limits.max_input_estimate * .9)
+
+        if minimal:
+            message.omitted_observations = len(message.observations)
+            message.observations = []
+            message.cold_evidence = []
+            message.cold_evidence_next_cursor = None
+            original_count = len(message.evidence)
+            note = {"code": "context_minimal_view", "history_omitted": query.conversation is not None,
+                    "omitted_observations": message.omitted_observations, "omitted_source_count": 0,
+                    "latest_operations_navigation_only": [{"call_id": o.call.call_id, "name": o.call.name, "ok": o.outcome.ok,
+                                                          "error_code": o.outcome.error.code if o.outcome.error else None}
+                                                         for o in state.observations[-2:]],
+                    "guidance": "旧历史和部分工具观测未放入本次最小终答视图，原记录保留；不能据缺失推断源码事实，仅引用当前原文。"}
+            message.observation_notes.append(note)
+            rebuild()
+            while (prepared_call.input_size > limits.max_input_estimate or not prepared_call.measurement.get("hard_fits", True)) and message.evidence:
+                removable = evidence_manager.cooling_order(selection_query or query.question, message.evidence) if evidence_manager else message.evidence
+                item = removable[0] if removable else message.evidence[0]
+                message.evidence.remove(item)
+                note["omitted_source_count"] = original_count - len(message.evidence)
+                rebuild()
+            revision = evidence_manager.revision + int([e.evidence_id for e in message.evidence] != evidence_manager.active_ids) if evidence_manager else 0
+            if message.evidence_view_revision != revision:
+                message.evidence_view_revision = revision
+                rebuild()
+            return ContextBuild(message, prepared_call, False, preparation_count, output_limit,
+                                message.evidence_view_revision)
 
         # Only pressure permits progressively moving unpinned source out of view.
         # Source originals and catalog locations remain in state/session.

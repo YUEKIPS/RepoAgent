@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # 发行包元数据；源码包位于 src/repoagent。
 name = "repoagent"
-version = "1.1.0"
+version = "0.14.4"
 description = "Evidence-grounded repository analysis"
 requires-python = ">=3.12,<3.13"
 # 已在本机验证的运行依赖；pytest/Ruff 属于 environment.yml 中的开发工具。

@@ -41,6 +41,9 @@ class HistoryPolicy:
                 answer=result.get("answer"),
                 execution_status=result.get("execution_status") or job["state"],
                 answer_status=result.get("answer_status"),
+                citation_validation=result.get("citation_validation", "none"),
+                unvalidated_claim_ids=result.get("unvalidated_claim_ids", []),
+                affected_claim_ids=result.get("affected_claim_ids", []),
                 historical_locations=[
                     {
                         k: c[k]

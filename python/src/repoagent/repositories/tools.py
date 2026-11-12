@@ -6,7 +6,12 @@ import json
 
 from repoagent.execution.contracts import origin_fields
 from repoagent.repositories.github import GitHubError
-from repoagent.repositories.sources import GitHubSource, LocalSnapshotSource
+from repoagent.repositories.sources import (
+    GitHubSource,
+    LocalSnapshotSource,
+    SnapshotLease,
+    source_text,
+)
 from repoagent.tools.store import (
     MAX_RESULT_BYTES,
     SnapshotTools,
@@ -26,6 +31,8 @@ class CursorStale(ToolParameterError):
 def tool_for(source):
     if isinstance(source, GitHubSource):
         return RepositoryTools(source)
+    if isinstance(source, SnapshotLease):
+        return SnapshotTools(source)
     return SnapshotTools(
         source.root if isinstance(source, LocalSnapshotSource) else source
     )
@@ -226,8 +233,13 @@ class RepositoryTools:
             ["get_symbol", {"name": name, "path": path}],
         )
 
-    def read_file(self, path, start_line=1, end_line=None, start_column=0):
+    def read_file(self, path, start_line=1, end_line=None, start_column=0, symbol=None, verification_of=None):
         safe_relative(path)
+        if symbol is not None:
+            candidates = self.get_symbol(symbol, path=path, limit=100)["items"]
+            if len(candidates) != 1:
+                raise ToolParameterError("Symbol must identify one indexed declaration")
+            start_line, end_line, start_column = candidates[0]["start_line"], candidates[0]["end_line"], 0
         text = self.source.read_text(path)
         return read_text_block(
             self._base(),
@@ -237,3 +249,12 @@ class RepositoryTools:
             end_line,
             start_column,
         )
+
+    def outline_file(self, path, limit=50, cursor=0, cached_only=False):
+        safe_relative(path)
+        text = source_text(self.source, path) if cached_only else self.source.read_text(path)
+        indexed = next((row for row in self.source.store.indexed(self.source.version) if row[0] == path), None)
+        rows = indexed[2] if indexed else []
+        return self._page(rows, self._base() | {"path": path, "file_total_lines": len(source_lines(text)),
+                          "declaration_coverage": "indexed" if indexed and indexed[1] == "parsed" else "text_only",
+                          "navigation_only": True}, limit, cursor, ["outline_file", {"path": path}])

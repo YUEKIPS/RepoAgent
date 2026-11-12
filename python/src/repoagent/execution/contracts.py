@@ -35,6 +35,9 @@ class ConversationTurn(StrictModel):
     answer: str | None = None
     execution_status: str
     answer_status: str | None = None
+    citation_validation: Literal["complete", "partial", "none"] = "none"
+    unvalidated_claim_ids: list[str] = Field(default_factory=list)
+    affected_claim_ids: list[str] = Field(default_factory=list)
     # 仅为重新查证的定位线索，不能作为本轮可引用Evidence。
     historical_locations: list[dict] = Field(default_factory=list)
 
@@ -118,7 +121,7 @@ class ConversationSummary(StrictModel):
     source_turn_ids: list[str]
     source_hash: str
     generation_id: str
-    prompt_version: str = "history-summary-v1"
+    prompt_version: str = "history-summary-v2-reviewed-answers"
     result: SummaryResult
 
 
@@ -237,14 +240,84 @@ class Claim(StrictModel):
     text: str = Field(min_length=1)
 
 
+class CitationReference(StrictModel):
+    evidence_id: str = Field(min_length=1)
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    claim_ids: list[str] = Field(min_length=1)
+
+
+class WireAnswer(StrictModel):
+    answer_status: Literal["answered", "insufficient_evidence"]
+    answer: str = Field(min_length=1)
+    claims: list[Claim] = Field(default_factory=list)
+    citations: list[CitationReference] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+
+class ReviewBodyEdit(StrictModel):
+    old_text: str = Field(min_length=1, max_length=3000)
+    new_text: str = Field(max_length=4000)
+
+
+class ReviewCitationEdit(StrictModel):
+    citation_index: int = Field(ge=0)
+    citation: CitationReference | None = None
+
+
+class ReviewPatch(StrictModel):
+    answer_status: Literal["insufficient_evidence"] | None = None
+    limitations_additions: list[str] = Field(default_factory=list, max_length=4)
+    body_edits: list[ReviewBodyEdit] = Field(default_factory=list, max_length=6)
+    claim_updates: list[Claim] = Field(default_factory=list, max_length=8)
+    remove_claim_ids: list[str] = Field(default_factory=list, max_length=8)
+    citation_edits: list[ReviewCitationEdit] = Field(default_factory=list, max_length=8)
+    citation_additions: list[CitationReference] = Field(default_factory=list, max_length=8)
+
+
+class ContentReview(StrictModel):
+    candidate_revision: str = Field(pattern=r"^[a-f0-9]{64}$")
+    verdict: Literal["ready", "revise", "needs_evidence", "unresolved"]
+    severity: Literal["minor", "major"] = "minor"
+    concerns: list[str] = Field(default_factory=list, max_length=6)
+    patch: ReviewPatch | None = None
+
+    @model_validator(mode="after")
+    def matching_revision(self):
+        if self.verdict == "ready" and (self.concerns or self.severity != "minor"):
+            raise ValueError("Ready cannot also report an unresolved concern")
+        if (self.verdict == "revise") != (self.patch is not None):
+            raise ValueError("Only revise supplies a local patch")
+        if self.verdict != "ready" and not self.concerns:
+            raise ValueError("Missing concrete review concerns")
+        return self
+
+
 # 最终作答契约：answered或insufficient_evidence，以及结论、引用与限制。
 class Answer(StrictModel):
     answer_status: Literal["answered", "insufficient_evidence"]
     answer: str = Field(min_length=1)
     # default_factory为每个实例新建列表；不共享不同任务的可变容器。
     claims: list[Claim] = Field(default_factory=list)
-    citations: list[Citation] = Field(default_factory=list)
+    citations: list[Citation | CitationReference] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+
+
+def materialize_answer(answer, evidence):
+    """Resolve known IDs on the host; retain unknown references without invented identity."""
+    by_id = {e.evidence_id: e for e in evidence}
+    citations = []
+    for ref in answer.citations:
+        item = by_id.get(ref.evidence_id)
+        if isinstance(ref, CitationReference) and item is not None:
+            citations.append(Citation(
+                **item.model_dump(exclude={"text", "start_line", "end_line"}),
+                start_line=ref.start_line, end_line=ref.end_line, claim_ids=ref.claim_ids.copy(),
+            ))
+        else:
+            citations.append(ref.model_copy(deep=True))
+    return Answer(answer_status=answer.answer_status, answer=answer.answer,
+                  claims=answer.claims, citations=citations, limitations=answer.limitations)
 
 
 # 局部修正仅能替换引用；来源身份和结论关联由宿主补齐。
@@ -322,10 +395,13 @@ class Observation(StrictModel):
 
 # 每次请求的显式上下文：阶段、指令、当前问题、累计证据、工具和观测。
 class ModelRequest(StrictModel):
+    source_capabilities: dict = Field(default_factory=dict)
+    investigation: dict | None = None
+    review_input: dict | None = None
     navigation_hints: list[dict] = Field(
         default_factory=list, exclude_if=lambda v: not v
     )
-    stage: Literal["plan", "answer", "act", "summary"]
+    stage: Literal["plan", "answer", "act", "summary", "review"]
     instruction: str
     query: Query
     evidence: list[Evidence] = Field(default_factory=list)
@@ -333,6 +409,9 @@ class ModelRequest(StrictModel):
     evidence_namespace: str = ""
     evidence_view_revision: int = Field(default=0, ge=0)
     evidence_rebase: bool = False
+    force_no_tools: bool = False
+    retrieval_stop_reason: str | None = None
+    source_restrictions: dict[str, str] = Field(default_factory=dict)
     deferred_evidence_ids: list[str] = Field(default_factory=list)
     # 工具观测是数据，不拥有修改系统权限的效力。
     observations: list[Observation] = Field(default_factory=list)
@@ -353,24 +432,49 @@ class ModelRequest(StrictModel):
 
 # 统一内部响应：规划、最终回答、单工具或批工具，kind决定唯一载荷。
 class ModelResponse(StrictModel):
-    kind: Literal["plan", "answer", "tool_call", "tool_calls", "summary", "citation_patch"]
+    kind: Literal["plan", "answer", "tool_call", "tool_calls", "summary", "citation_patch", "review"]
     plan: Plan | None = None
     answer: Answer | None = None
     tool_call: ToolCall | None = None
     tool_calls: list[ToolCall] | None = Field(default=None, min_length=1, max_length=8)
     summary: SummaryResult | None = None
     citation_patch: CitationPatch | None = None
+    review: ContentReview | None = None
 
     @model_validator(mode="after")
     def matching_payload(self):
         """根据kind检查恰好一个对应载荷存在；拒绝混合或缺失的响应。"""
-        for name in ("plan", "answer", "tool_call", "tool_calls", "summary", "citation_patch"):
+        for name in ("plan", "answer", "tool_call", "tool_calls", "summary", "citation_patch", "review"):
             if (getattr(self, name) is not None) != (self.kind == name):
                 raise ValueError("Response kind and payload do not match")
         return self
 
 
 # 单任务的累计证据、工具观测、调用ID和重复检测签名；不拼接跨任务历史。
+class TaskObjective(StrictModel):
+    objective_id: str = Field(min_length=1, max_length=80)
+    text: str = Field(min_length=1, max_length=2000)
+    status: Literal["open", "addressed", "unresolved", "out_of_scope"] = "open"
+    fact_ids: list[str] = Field(default_factory=list, max_length=64)
+
+
+class TaskFact(StrictModel):
+    fact_id: str = Field(min_length=1, max_length=80)
+    text: str = Field(min_length=1, max_length=4000)
+    conditions: list[str] = Field(default_factory=list, max_length=16)
+    basis: Literal["source", "inference", "background"] = "source"
+    evidence_ids: list[str] = Field(default_factory=list, max_length=32)
+
+
+class InvestigationState(StrictModel):
+    goal: str = ""
+    objectives: list[TaskObjective] = Field(default_factory=list, max_length=48)
+    facts: list[TaskFact] = Field(default_factory=list, max_length=96)
+    revision: int = Field(default=0, ge=0)
+    review_concerns: list[str] = Field(default_factory=list)
+    strategy_hint: str | None = None
+
+
 class AgentState(StrictModel):
     """Current work state; tool observations are derived from Session events."""
 
@@ -380,6 +484,13 @@ class AgentState(StrictModel):
     consecutive_no_progress: int = Field(default=0, ge=0)
     recovered_signatures: list[str] = Field(default_factory=list)
     cached_tool_calls: dict[str, str] = Field(default_factory=dict)
+    investigation: InvestigationState = Field(default_factory=InvestigationState)
+    verification_attempts: list[str] = Field(default_factory=list)
+    strategy_recovery_used: bool = False
+    semantic_review_done: bool = False
+    review_request_started: bool = False
+    review_followup_models_left: int | None = Field(default=None, ge=0)
+    review_followup_tools_left: int | None = Field(default=None, ge=0)
     session_id: str | None = None
     run_id: str | None = None
     applied_event_seq: int = Field(default=0, ge=0)
@@ -437,7 +548,9 @@ class ModelCallRecord(StrictModel):
     usage_batch_id: str | None = None
     usage_status: Literal["reported", "unknown", "not_sent", "duplicate"] | None = None
     finish_reason: str | None = None
-    response_shape: Literal["plan_object", "answer_object", "summary_object"] | None = None
+    response_shape: Literal["plan_object", "answer_object", "summary_object", "citation_patch_object", "review_object"] | None = None
+    response_recovery: Literal["json_string_control_characters"] | None = None
+    validation_stage: Literal["json_syntax", "schema"] | None = None
     error_code: str | None = None
     # 仅安全的异常类别，不保存异常文字、代理地址、请求头或凭据。
     transport_failure: (
@@ -495,7 +608,7 @@ class Notice(StrictModel):
 
 
 class Result(StrictModel):
-    schema_version: Literal["result-v2"]
+    schema_version: Literal["result-v3"]
     repository_access: dict = Field(default_factory=dict, exclude_if=lambda v: not v)
     task_id: str
     workspace: Workspace
@@ -505,7 +618,13 @@ class Result(StrictModel):
     answer: str | None = None
     claims: list[Claim] = Field(default_factory=list)
     citations: list[Citation] = Field(default_factory=list)
-    original_citations: list[Citation]
+    original_citations: list[Citation | CitationReference]
+    citation_validation: Literal["complete", "partial", "none"] = "none"
+    citation_diagnostics: list[dict] = Field(default_factory=list)
+    affected_claim_ids: list[str] = Field(default_factory=list)
+    unvalidated_claim_ids: list[str] = Field(default_factory=list)
+    citation_contexts: list[dict] = Field(default_factory=list)
+    recovery_summary: list[dict] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     notices: list[Notice]
     coverage_summary: dict

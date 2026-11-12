@@ -4,7 +4,7 @@
   "base_url": "https://api.deepseek.com",
   "key_env": "DEEPSEEK_API_KEY",
   "account_scope": "default",
-  "request_timeout_seconds": 120.0,
+  "request_timeout_seconds": 30.0,
   "schema_version": 3,
   "protocol": "chat_completions",
   "generation": {

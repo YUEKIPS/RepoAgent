@@ -1,0 +1,13 @@
+{
+  "kind": "development-source-snapshot",
+  "version": "0.14.4",
+  "local_source_commit": "4e8088b56ba7d1361b2f1dfed8666d0635aaa7f6",
+  "wheel_sha256": "0b44c0dac4ef147b39e2aa53f19143220c6ef73a6483572f93f51f4ae66df641",
+  "execution": "v41",
+  "prompt": "v26",
+  "tools": "v16",
+  "package_resources": 100,
+  "data_directory": "work/web-snapshot-0.14.4",
+  "data_migration": false,
+  "project_license_not_selected": true
+}

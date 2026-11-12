@@ -2,12 +2,39 @@
 
 from repoagent.execution.contracts import ModelRequest
 from repoagent.execution.control import StopExecution
+from repoagent.execution.prompt_spec import STEP_SUMMARY
 from repoagent.execution.summary import SummaryService
 from repoagent.models.base import ModelServiceError
 
 
 class PressureCoordinator:
     def prepare(self, execution, build, *, force=False):
+        try:
+            return self._prepare(execution, build, force=force)
+        except (StopExecution, ModelServiceError) as error:
+            reason = error.reason if isinstance(error, StopExecution) else error.code
+            recoverable = {"context_no_summary_budget", "context_protected_content", "context_summary_input", "context_no_progress", "invalid_summary_provenance"}
+            if reason not in recoverable or execution.minimal_context or execution.repair_feedback:
+                raise
+            execution.guard()
+            execution.session.ensure_healthy()
+            execution.session.reset_protocol()
+            execution.minimal_context = True
+            execution.isolated_finalization = True
+            execution.pressure_pending = None
+            execution.pending_response = None
+            execution.stop_retrieval(reason)
+            execution.recovery_events.append({"stage": "context", "reason": reason, "action": "minimal_final_view"})
+            built = build(True)
+            if built.prepared_call.input_size > execution.session.max_input or not built.prepared_call.measurement.get("hard_fits", True):
+                execution.session.discard(built.prepared_call)
+                raise StopExecution("BUDGET_EXCEEDED", "context_protected_content") from None
+            execution.trace.append({"event": "minimal_final_context", "reason": reason,
+                                    "evidence_ids": [e.evidence_id for e in built.message.evidence]})
+            execution.checkpoint("context_ready")
+            return built
+
+    def _prepare(self, execution, build, *, force=False):
         if execution.pressure_pending:
             if not execution.pending_response or execution.pending_response.kind != "summary":
                 raise ModelServiceError(code="context_summary_response_unavailable")
@@ -58,10 +85,7 @@ class PressureCoordinator:
                 if not material:
                     raise StopExecution("BUDGET_EXCEEDED", "context_protected_content")
                 request = ModelRequest(stage="summary", query=execution.query.model_copy(update={"conversation": None}),
-                    instruction=("Summarize completed tool steps as data. Preserve corrections, failures, remaining tasks, "
-                                 "file locations and evidence IDs as navigation only. Do not invent source facts. "
-                                 "Unpublished candidate answers are not established facts. "
-                                 "Use only source_turn_id in each item's turn_ids. Return SummaryResult JSON in Chinese."),
+                    instruction=STEP_SUMMARY,
                     runtime_summary_input=material)
                 prepared = execution.session.prepare(request)
                 if prepared.input_size > execution.session.max_input or not prepared.measurement.get("hard_fits", True):
@@ -104,6 +128,8 @@ class PressureCoordinator:
             execution.summary_sink(record)
 
     def _invoke(self, execution, prepared, kind, material):
+        request = ModelRequest.model_validate_json(prepared.request_json)
+        material = request.summary_input.model_dump() if kind == "history" else request.runtime_summary_input
         execution.pressure_pending = {"kind": kind, "material": material}
         execution.context_compacting = True
         execution.journal.start("summary")

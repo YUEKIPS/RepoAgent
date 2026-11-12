@@ -47,6 +47,26 @@ class LocalSnapshotSource:
 
 
 @dataclass(frozen=True)
+class SnapshotLease(LocalSnapshotSource):
+    """One task's attested index; actual source reads still verify object hashes."""
+    manifest: object
+    index_data: bytes
+
+    @classmethod
+    def capture(cls, source):
+        root = source.root if isinstance(source, LocalSnapshotSource) else Path(source)
+        root = root.absolute()
+        manifest = verify_snapshot(root)
+        index = contained(root, "index.sqlite3").read_bytes()
+        if hashlib.sha256(index).hexdigest() != manifest.index_sha256:
+            raise ValueError("Snapshot index changed during binding")
+        return cls(root, manifest, index)
+
+    def descriptor(self):
+        return self.manifest.model_copy(deep=True)
+
+
+@dataclass(frozen=True)
 class GitHubDescriptor:
     source_version_id: str
     commit: str

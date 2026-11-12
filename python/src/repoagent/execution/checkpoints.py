@@ -7,7 +7,7 @@ import time
 from repoagent.execution.control import StopExecution
 from repoagent.execution.conversation_session import ConversationSession
 
-CHECKPOINT_VERSION = "execution-checkpoint-v5-evidence-view"
+CHECKPOINT_VERSION = "execution-checkpoint-v8-bounded-review"
 
 
 class CheckpointStore:

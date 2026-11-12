@@ -751,13 +751,23 @@ class ChatService:
                 self.conversations.save(self.jobs[task_id])
         return self.get(task_id)
 
-    def source(self, task_id, citation_index, start=None, column=0):
+    def source(self, task_id, citation_index, start=None, column=0, context=False):
         job = self.get(task_id)
         result = job.get("result") or {}
         citations = result.get("citations", [])
         if not 0 <= citation_index < len(citations):
             raise ServiceError("unknown_citation", 404)
         c = citations[citation_index]
+        if context:
+            contexts = result.get("citation_contexts", [])
+            if not 0 <= citation_index < len(contexts):
+                raise ServiceError("source_context_unavailable", 404)
+            block = contexts[citation_index]
+            if (origin_fields(block) != origin_fields(c)
+                or any(block[k] != c[k] for k in ("repo_id", "commit", "path", "evidence_id"))
+                or not block["start_line"] <= c["start_line"] <= c["end_line"] <= block["end_line"]):
+                raise ServiceError("source_context_unavailable", 409)
+            c = block
         repository = c["repo_id"]
         if job["workspace"]:
             if result.get("workspace") != job["workspace"]:

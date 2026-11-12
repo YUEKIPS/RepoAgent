@@ -21,7 +21,7 @@ from repoagent.execution.contracts import (
     ToolOutcome,
 )
 
-SESSION_VERSION = "conversation-events-v2-context"
+SESSION_VERSION = "conversation-events-v5-bounded-review"
 
 
 class Data(BaseModel):
@@ -100,6 +100,7 @@ SCHEMAS = {
     "assistant/plan": AssistantData,
     "assistant/citation_patch": AssistantData,
     "context/summary_response": AssistantData,
+    "context/review_response": AssistantData,
     "tool/call": CallData,
     "tool/result": OutcomeData,
     "host/tool_result": OutcomeData,
@@ -146,7 +147,7 @@ class SessionEvent(BaseModel):
         if schema is None:
             raise ValueError("Unknown session event type")
         schema.model_validate(self.data)
-        expected = {"assistant/plan": {"plan"}, "assistant/citation_patch": {"citation_patch"}, "context/summary_response": {"summary"},
+        expected = {"assistant/plan": {"plan"}, "assistant/citation_patch": {"citation_patch"}, "context/summary_response": {"summary"}, "context/review_response": {"review"},
                     "assistant/message": {"answer", "tool_call", "tool_calls"}}.get(self.type)
         if expected and self.data["response"]["kind"] not in expected:
             raise ValueError("Session assistant event kind mismatch")
@@ -414,7 +415,10 @@ class ConversationSession:
             result = job.get("result") or {}
             rows.append({"turn_id": job["id"], "question": job["question"], "log_text": job.get("log_text"),
                          "answer": result.get("answer"), "execution_status": result.get("execution_status") or job["state"],
-                         "answer_status": result.get("answer_status"), "historical_locations": result.get("citations", [])})
+                         "answer_status": result.get("answer_status"), "historical_locations": result.get("citations", []),
+                         "citation_validation": result.get("citation_validation", "none"),
+                         "unvalidated_claim_ids": result.get("unvalidated_claim_ids", []),
+                         "affected_claim_ids": result.get("affected_claim_ids", [])})
         ids = list(dict.fromkeys((previous.source_turn_ids if previous else []) + [r["turn_id"] for r in rows]))
         return {"turns": rows, "previous_summary": previous.model_dump() if previous else None,
                 "source_turn_ids": ids, "covered_through_sequence": covered + len(rows),

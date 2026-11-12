@@ -14,6 +14,11 @@ from uuid import uuid4
 
 from pydantic import Field
 
+from repoagent.execution.content_review import (
+    apply_review_patch,
+    candidate_revision,
+    review_risks,
+)
 from repoagent.execution.context import ContextBuilder
 from repoagent.execution.contracts import (
     AgentState,
@@ -28,6 +33,7 @@ from repoagent.execution.contracts import (
     ToolCall,
     ToolOutcome,
     Usage,
+    materialize_answer,
     origin_fields,
 )
 from repoagent.execution.control import StopExecution, estimate
@@ -38,12 +44,14 @@ from repoagent.execution.limits import Limits
 from repoagent.execution.model_session import ModelSession
 from repoagent.execution.notices import LIVE_NOTE
 from repoagent.execution.pressure import PressureCoordinator
+from repoagent.execution.prompt_spec import FORMAT_GUIDANCE
 from repoagent.execution.publication import AnswerPublisher, CitationValidationError
 from repoagent.execution.publication import (
     citations_with_context as citations_with_context,
 )
 from repoagent.execution.publication import validate_citations as validate_citations
 from repoagent.execution.repair import (
+    PatchValidationError,
     RepairPolicy,
     apply_citation_patch,
     full_rewrite_feedback,
@@ -62,9 +70,9 @@ from repoagent.repositories.sources import GitHubSource, descriptor, source_text
 from repoagent.repositories.text import TEXT_ERRORS
 from repoagent.tools.protocol import SCHEMA_VERSION, Dispatcher, builtin_registry
 from repoagent.tools.store import source_lines
-from repoagent.tools.workspace import WorkspaceTools
+from repoagent.tools.workspace import SOURCE_RESTRICTION_ERRORS, WorkspaceTools
 
-PROTOCOL_VERSION = "controlled-execution-v35-io-timeouts"
+PROTOCOL_VERSION = "controlled-execution-v41-unified-thinking"
 
 
 # 可配对复用的准备结果：查询、限制、模型ID、证据、用量、轨迹与耗时。
@@ -138,8 +146,20 @@ class Execution:
         # 可观察任务状态、用量、轨迹分别存放；新任务的列表由default_factory独立创建。
         self.usage = Usage(model_id=model.model_id, simulated=model.simulated)
         self.state = AgentState()
+        self.state.investigation.goal = self.query.question
         self.format_repairs = 0
+        self.format_repair_scopes = {}
+        self.protocol_repairs = {}
+        self.isolated_finalization = False
+        self.minimal_context = False
+        self.last_candidate = None
+        self.last_candidate_evidence = []
+        self.completed_result = None
+        self.recovery_events = []
+        self.patch_rejections = 0
+        self.source_restrictions = self.tools.restrictions
         self.repair_notice = ""
+        self.review_input = None
         self.answer_evidence = None
         self.source_failure = None
         self.finalization_reason = None
@@ -258,14 +278,14 @@ class Execution:
     def _after_response(self, response):
         from repoagent.execution.contracts import ModelRequest
         self.pending_response = response
-        kind = {"plan": "assistant/plan", "summary": "context/summary_response", "citation_patch": "assistant/citation_patch"}.get(response.kind, "assistant/message")
+        kind = {"plan": "assistant/plan", "summary": "context/summary_response", "citation_patch": "assistant/citation_patch", "review": "context/review_response"}.get(response.kind, "assistant/message")
         self.conversation_session.append(kind, {
             "run_id": self.task_id, "step": self.journal.sequence,
             "response": response.model_dump(),
         }, surface_op="append" if kind == "assistant/message" and response.kind != "citation_patch" else None)
         if self.prepared_identity:
             request = ModelRequest.model_validate_json(self.prepared_identity["request_json"])
-            if request.stage != "summary":
+            if request.stage in {"act", "answer"} and not is_citation_patch(request.repair_feedback):
                 self.evidence_manager.commit_view(e.evidence_id for e in request.evidence)
                 self.evidence_manager.decision_completed([e.evidence_id for e in request.evidence] + request.deferred_evidence_ids)
         if response.kind == "plan":
@@ -328,7 +348,18 @@ class Execution:
                 "source_failure": self.source_failure,
                 "finalization_reason": self.finalization_reason,
                 "format_repairs": self.format_repairs,
+                "format_repair_scopes": self.format_repair_scopes,
+                "protocol_repairs": self.protocol_repairs,
+                "isolated_finalization": self.isolated_finalization,
+                "minimal_context": self.minimal_context,
+                "last_candidate": self.last_candidate.model_dump() if self.last_candidate else None,
+                "last_candidate_evidence": [e.model_dump() for e in self.last_candidate_evidence],
+                "completed_result": self.completed_result.model_dump(exclude={"trace", "usage"}) if self.completed_result else None,
+                "recovery_events": self.recovery_events,
+                "patch_rejections": self.patch_rejections,
+                "source_restrictions": self.source_restrictions,
                 "repair_feedback": self.repair_feedback,
+                "review_input": self.review_input,
                 "repair_seen": self.repair_policy.seen,
                 "repair_attempts": self.repair_policy.attempts,
                 "candidate_revision": self.candidate_revision,
@@ -406,10 +437,16 @@ class Execution:
         self.trace[:] = saved["trace"]
         self.limitations[:] = saved["limitations"]
         self.journal.sequence = max((t.get("step", 0) for t in self.trace), default=0)
-        for name in ("source_failure", "finalization_reason", "format_repairs", "repair_feedback", "candidate_revision", "initial_hits", "initial_cursor", "initial_complete", "phase"):
+        for name in ("source_failure", "finalization_reason", "format_repairs", "repair_feedback", "review_input", "candidate_revision", "initial_hits", "initial_cursor", "initial_complete", "phase"):
             setattr(self, name, saved[name])
         self.repair_policy.seen = saved["repair_seen"]
         self.repair_policy.attempts = saved["repair_attempts"]
+        for name in ("format_repair_scopes", "protocol_repairs", "isolated_finalization", "minimal_context", "recovery_events", "patch_rejections", "source_restrictions"):
+            setattr(self, name, saved[name])
+        self.tools.restrictions = self.source_restrictions
+        self.last_candidate = Answer.model_validate(saved["last_candidate"]) if saved["last_candidate"] else None
+        self.last_candidate_evidence = [Evidence.model_validate(e) for e in saved["last_candidate_evidence"]]
+        self.completed_result = Result.model_validate(saved["completed_result"] | {"trace": self.trace.copy(), "usage": self.usage}) if saved["completed_result"] else None
         self.pending_response = ModelResponse.model_validate(saved["pending_response"]) if saved["pending_response"] else None
         self.pending_calls = [ToolCall.model_validate(c) for c in saved["pending_calls"]]
         if self.state.pending_call_ids != [call.call_id for call in self.pending_calls]:
@@ -469,40 +506,65 @@ class Execution:
         纠正也走同一个请求入口并计次数和实际用量；其他服务故障直接向外传播。
         只把脱敏字段诊断反馈模型，不回显非法响应内容。
         """
-        try:
+        if stage == "review":
+            # One metered attempt; optional review never silently spends another full budget.
+            if self.state.review_request_started:
+                raise ModelServiceError(code="review_attempt_already_used")
+            self.state.review_request_started = True
+            self.checkpoint("review_pending")
             return self._request_once(stage)
-        except ModelServiceError as error:
-            if error.code == "model_context_exceeded":
-                self.session.ensure_healthy()
-                self.force_compact = True
-                return self._request_once(stage)
-            if (
-                error.code != "invalid_model_response"
-                or not self.session.format_repair
-                or self.format_repairs
-                or self.usage.model_requests >= self.limits.max_model_requests
-            ):
-                raise
-            # 格式纠正只允许一次，后续仍走同一限额和请求记录入口，不退还第一次失败消耗。
-            self.format_repairs += 1
-            errors = error.record.validation_errors if error.record else []
-            self.repair_notice = (
-                " Previous response failed JSON/schema validation: "
-                + ", ".join(errors)
-                + ". Produce a fresh response following the exact current schema; no extra fields or prose."
-            )
-            self.trace.append(
-                {
-                    "event": "format_repair",
-                    "stage": stage,
-                    "attempt": 1,
-                    "errors": errors,
-                }
-            )
-            try:
-                return self._request_once(stage)
-            finally:
-                self.repair_notice = ""
+        scope = f"{stage}:{self.candidate_revision}"
+        compacted = False
+        try:
+            while True:
+                try:
+                    return self._request_once(stage)
+                except ModelServiceError as error:
+                    if error.code == "model_context_exceeded" and not compacted:
+                        self.session.ensure_healthy()
+                        compacted = True
+                        self.force_compact = True
+                        continue
+                    if error.code in {"invalid_model_tool_arguments", "unexpected_model_response"} and stage == "act":
+                        if self.recover_protocol(error.code):
+                            continue
+                    if (error.code != "invalid_model_response" or not self.session.format_repair
+                        or self.format_repair_scopes.get(scope, 0)
+                        or self.usage.model_requests >= self.limits.max_model_requests):
+                        raise
+                    try:
+                        self.session.ensure_healthy()
+                    except ModelServiceError:
+                        raise error from None
+                    self.format_repairs += 1
+                    self.format_repair_scopes[scope] = 1
+                    errors = error.record.validation_errors if error.record else []
+                    self.repair_notice = (
+                        "上一条响应未通过JSON/schema验证：" + ", ".join(errors)
+                        + "。" + FORMAT_GUIDANCE
+                    )
+                    self.trace.append({"event": "format_repair", "stage": stage, "scope": scope,
+                                       "attempt": 1, "errors": errors})
+                    self.recovery_events.append({"stage": stage, "reason": "invalid_model_response", "action": "format_repair"})
+        finally:
+            self.repair_notice = ""
+
+    def recover_protocol(self, reason):
+        """Reject an entire invalid batch, then request one isolated final answer."""
+        if self.protocol_repairs.get(reason) or self.usage.model_requests >= self.limits.max_model_requests:
+            return False
+        self.session.ensure_healthy()
+        self.protocol_repairs[reason] = 1
+        self.session.reset_protocol()
+        self.pending_calls = []
+        self.pending_response = None
+        self.isolated_finalization = True
+        self.stop_retrieval(reason)
+        event = {"stage": "act", "reason": reason, "action": "isolated_final_answer", "tools_executed": False}
+        self.recovery_events.append(event)
+        self.trace.append({"event": "protocol_recovered", **event})
+        self.checkpoint("ready")
+        return True
 
     def _request_once(self, stage: str) -> ModelResponse:
         """执行一次受控模型请求并返回重新校验的ModelResponse。
@@ -511,9 +573,13 @@ class Execution:
         真实调用先登记并领取发送权，finally记录失败也可能产生的用量；超限通过停止信号退出。
         """
         self.guard()
+        if stage == "act" and self.state.review_followup_models_left == 0:
+            raise StopExecution("BUDGET_EXCEEDED", "content_review_followup")
         if self.usage.model_requests >= self.limits.max_model_requests:
             raise StopExecution("BUDGET_EXCEEDED", "model_requests")
         if stage == "act":
+            if self.state.review_followup_tools_left == 0:
+                self.stop_retrieval("content_review_tools")
             if self.source_failure:
                 self.stop_retrieval(self.source_failure)
             elif self.usage.tool_calls >= self.limits.max_tool_calls:
@@ -541,6 +607,11 @@ class Execution:
             evidence_manager=self.evidence_manager,
             repair_feedback=self.repair_feedback,
             selection_query=self.query.question + " " + " ".join(self.initial_plan.queries if self.initial_plan else []),
+            force_no_tools=self.isolated_finalization,
+            minimal=self.minimal_context,
+            source_restrictions=self.source_restrictions,
+            review_input=self.review_input if stage == "review" else None,
+            source_capabilities=self.tools.capabilities(),
         )
         built = self.pressure.prepare(self, build, force=self.force_compact)
         self.force_compact = False
@@ -582,7 +653,7 @@ class Execution:
         previous_records = len(self.session.records)
         self.journal.start(stage)
         self.candidate_revision += 1
-        if self.stream_sink and not is_citation_patch(message.repair_feedback):
+        if self.stream_sink and stage in {"act", "answer"} and not is_citation_patch(message.repair_feedback):
             self.stream_sink({"event": "draft_start", "candidate_revision": self.candidate_revision})
         self.checkpoint("model_pending")
         try:
@@ -604,6 +675,8 @@ class Execution:
                     {"event": "model_usage", "record": record.model_dump()}
                 )
             self.refresh_usage()
+            if stage == "act" and self.state.review_followup_models_left is not None:
+                self.state.review_followup_models_left = max(0, self.state.review_followup_models_left - (self.usage.model_requests - previous_calls))
         response = ModelResponse.model_validate(response.model_dump())
         self.journal.responded(response.kind)
         size = estimate(response.model_dump())
@@ -619,21 +692,15 @@ class Execution:
         if response.kind not in allowed:
             raise StopExecution("FAILED", "unexpected_model_response")
         if stage == "act" and not can_use_tools and response.kind not in {"answer", "citation_patch"}:
-            if self.finalization_reason:
-                raise StopExecution("FAILED", "tool_requested_after_finalization")
-            reason = (
-                "model_requests"
-                if self.usage.model_requests >= self.limits.max_model_requests
-                else "tool_calls"
-                if self.usage.tool_calls >= self.limits.max_tool_calls
-                else "input_estimate"
-            )
-            raise StopExecution("BUDGET_EXCEEDED", reason)
+            reason = "tool_requested_after_finalization"
+            if not self.recover_protocol(reason):
+                raise StopExecution("FAILED", reason)
+            return self.request(stage)
         if response.kind in {"answer", "citation_patch"}:
             self.answer_evidence = [e.model_copy(deep=True) for e in message.evidence]
         # Only an accepted investigation/answer decision consumes the lease.
         # Ending a lease does not cool source; pressure is the only cooler.
-        if stage != "summary":
+        if stage in {"act", "answer"} and not is_citation_patch(message.repair_feedback):
             self.evidence_manager.commit_view(e.evidence_id for e in message.evidence)
             self.evidence_manager.decision_completed([e.evidence_id for e in message.evidence] + message.deferred_evidence_ids)
         self.pending_response = response
@@ -652,6 +719,8 @@ class Execution:
             raise StopExecution("BUDGET_EXCEEDED", "tool_calls")
         # 计的是尝试而不只是成功次数；未知工具和坏参数也占额度，防止无限修正。
         self.usage.tool_calls += 1
+        if self.state.review_followup_tools_left is not None:
+            self.state.review_followup_tools_left = max(0, self.state.review_followup_tools_left - 1)
         self.conversation_session.append("tool/call", {
             "run_id": self.task_id, "step": self.journal.sequence, "call": call.model_dump(),
         })
@@ -680,7 +749,7 @@ class Execution:
             cache_key = json.dumps([call.name, self.registry.arguments(call), self.tools.generations()], sort_keys=True, ensure_ascii=False)
         except (KeyError, ValueError):
             cache_key = None
-        cacheable = call.name in {"read_file", "get_symbol", "search_code", "list_directory"} and self.registry.spec(call.name).origin == "builtin"
+        cacheable = call.name in {"read_file", "get_symbol", "search_code", "list_directory", "outline_file"} and self.registry.spec(call.name).origin == "builtin"
         cached_id = self.state.cached_tool_calls.get(cache_key) if cacheable else None
         cached = next((event["data"]["observation"]["outcome"] for event in reversed(self.conversation_session.events())
                        if event["type"] == "tool/settled" and event["data"]["observation"]["call"]["call_id"] == cached_id), None) if cached_id and call.name != "expand_evidence" else None
@@ -697,26 +766,14 @@ class Execution:
         if outcome.ok and cache_key is not None and cacheable:
             settled_key = json.dumps([call.name, self.registry.arguments(call), self.tools.generations()], sort_keys=True, ensure_ascii=False)
             self.state.cached_tool_calls[settled_key] = call.call_id
-        if not outcome.ok and outcome.error.code in {
-            "connection_or_tls_failed",
-            "dns_timeout",
-            "request_timeout",
-            "rate_limited",
-            "network_time_limit",
-            "network_byte_limit",
-            "network_request_limit",
-            "new_file_limit",
-            "credential_rejected",
-            "access_denied",
-            "cache_full_with_protected_content",
-            "repository_disk_limit",
-        }:
-            self.source_failure = outcome.error.code
+        if not outcome.ok and outcome.error.code in SOURCE_RESTRICTION_ERRORS:
+            scope = call.arguments.get("repo_id", "*")
+            self.source_restrictions[scope] = outcome.error.code
             self.limitations.append(
-                "公开源码获取受到网络或资源限制，已停止新取证；仅依据本轮已取得原文说明缺口。"
+                f"公开源码获取受限：{scope} / {outcome.error.code}；该范围停止联网取证，其他允许来源与本地缓存仍可调查。"
             )
             self.trace.append(
-                {"event": "source_retrieval_stopped", "code": self.source_failure}
+                {"event": "source_retrieval_restricted", "scope": scope, "code": outcome.error.code}
             )
         self.trace.append(
             {
@@ -746,7 +803,7 @@ class Execution:
         if outcome.ok or outcome.error.recoverable:
             self.observe(call, outcome)
         if not outcome.ok:
-            if self.source_failure:
+            if outcome.error.recoverable:
                 return None
             raise StopExecution("FAILED", "validation_or_tool_error")
         return outcome.result
@@ -816,21 +873,25 @@ class Execution:
             self.initial_complete = True
             return prepared
         # 首次模型请求只生成字面检索规划，具体搜索与读取仍由程序执行。
-        plan = self.initial_plan or self.request("plan").plan
+        try:
+            plan = self.initial_plan or self.request("plan").plan
+        except ModelServiceError as error:
+            if error.code != "invalid_model_response" or self.mode != "agent":
+                raise
+            self.session.ensure_healthy()
+            self.initial_complete = True
+            self.pending_response = None
+            self.recovery_events.append({"stage": "plan", "reason": error.code, "action": "continue_investigation"})
+            self.journal.close("planning_unavailable")
+            self.checkpoint("ready")
+            return None
+        if self.finalization_reason:
+            self.initial_complete = True
+            self.pending_response = None
+            self.journal.close("retrieval_stopped")
+            self.checkpoint("ready")
+            return None
         search_kind = plan.kind
-        if (
-            self.query.workspace
-            and self.tools.generations()
-            and not any(
-                m.coverage.get("cached", 0)
-                for m in self.tools.manifests.values()
-                if getattr(m, "source_kind", "local_snapshot") == "github_lazy"
-            )
-        ):
-            search_kind = "path"
-            self.trace.append(
-                {"event": "cold_catalog_path_search", "requested_kind": plan.kind}
-            )
         hits = self.initial_hits or self.required_tool(
             "search_code",
             {
@@ -913,6 +974,9 @@ class Execution:
                 if outcome.error.code in TEXT_ERRORS and outcome.error.recoverable:
                     self.observe(call, outcome)
                     continue
+                if outcome.error.recoverable:
+                    self.observe(call, outcome)
+                    continue
                 raise StopExecution("FAILED", outcome.error.code)
             block = outcome.result
             if not block["truncated"] and block["end_line"] < end:
@@ -952,9 +1016,10 @@ class Execution:
         self.pending_response = None
         self.checkpoint("tools_pending" if self.pending_calls else "ready" if self.initial_complete else "preparing")
 
-    def finish(self, answer: Answer) -> Result:
+    def finish(self, answer: Answer, *, allow_warnings=False, delivery_reason=None) -> Result:
         self.guard()
         self.refresh_usage()
+        self.session.ensure_healthy()
         self.tools.verify()
         evidence = (
             self.state.evidence
@@ -969,9 +1034,13 @@ class Execution:
             observations=self.state.observations,
             trace=self.trace,
             finalization_reason=self.finalization_reason,
+            allow_warnings=allow_warnings,
+            recovery_summary=self.recovery_events,
+            delivery_reason=delivery_reason,
         )
         self.guard()
         self.journal.finish("SUCCEEDED")
+        self.completed_result = result
         self.checkpoint("result_ready")
         result.trace = self.trace.copy()
         return result
@@ -982,32 +1051,96 @@ class Execution:
         evidence = self.answer_evidence
         try:
             patched = apply_citation_patch(self.repair_feedback, response.citation_patch, evidence)
-        except (ValueError, KeyError, TypeError):
-            raise StopExecution("FAILED", "citation_patch_invalid") from None
+        except (ValueError, KeyError, TypeError) as error:
+            details = {"code": error.code, "citation_index": error.citation_index} if isinstance(error, PatchValidationError) else {"code": "citation_patch_invalid"}
+            return self.reject_patch(details)
         self.pending_response = None
         if patched is None:
             self.trace.append({"event": "citation_patch_fallback", "reason": response.citation_patch.status})
             self.repair_feedback = full_rewrite_feedback(self.repair_feedback)
+            if self.usage.model_requests >= self.limits.max_model_requests:
+                return self.deliver_candidate("citation_repair_budget")
             self.checkpoint("ready")
             return None
         if self.publisher.validate_candidate(patched, evidence, self.state.evidence):
-            raise StopExecution("FAILED", "citation_patch_invalid")
+            return self.reject_patch({"code": "citation_patch_validation_failed"})
         self.trace.append({"event": "citation_patch_applied", "candidate_revision": response.citation_patch.candidate_revision,
                            "citation_indices": [u.citation_index for u in response.citation_patch.citation_updates]})
         self.repair_feedback = None
-        return self.finish(patched)
+        return self.accept_candidate(patched)
+
+    def reject_patch(self, details):
+        self.pending_response = None
+        self.patch_rejections += 1
+        self.recovery_events.append({"stage": "citation_patch", "reason": details["code"], "action": "rejected", **details})
+        self.trace.append({"event": "citation_patch_rejected", **details})
+        if self.patch_rejections <= 1 and self.usage.model_requests < self.limits.max_model_requests:
+            self.repair_feedback = self.repair_feedback | {"last_rejection": details}
+            self.checkpoint("ready")
+            return None
+        return self.deliver_candidate("citation_patch_invalid")
+
+    def deliver_candidate(self, reason):
+        """Publishing warnings is local; never spends an extra model request."""
+        self.guard()
+        if self.last_candidate is None:
+            raise StopExecution("FAILED", reason)
+        self.answer_evidence = [e.model_copy(deep=True) for e in self.last_candidate_evidence]
+        self.recovery_events.append({"stage": "publication", "reason": reason, "action": "deliver_with_diagnostics"})
+        self.pending_response = None
+        return self.finish(self.last_candidate, allow_warnings=True, delivery_reason=reason)
+
+    def deliver_or_fail(self, reason):
+        try:
+            return self.deliver_candidate(reason)
+        except StopExecution as error:
+            return self.failed(error.status, error.reason)
+        except ModelServiceError as error:
+            return self.failed("FAILED", error.code)
+        except (ValueError, OSError, sqlite3.Error):
+            return self.failed("FAILED", "validation_or_tool_error")
 
     def accept_candidate(self, answer):
         evidence = self.answer_evidence if self.answer_evidence is not None else self.state.evidence
+        answer = materialize_answer(answer, evidence)
+        self.last_candidate = answer.model_copy(deep=True)
+        self.last_candidate_evidence = [e.model_copy(deep=True) for e in evidence]
         issues = self.publisher.validate_candidate(answer, evidence, self.state.evidence)
         if not issues:
+            if self.should_review(answer):
+                self.state.semantic_review_done = True
+                risks = review_risks(answer, self.state, self.finalization_reason, self.repair_feedback)
+                self.evidence_manager.protect(c.evidence_id for c in answer.citations)
+                candidate = answer.model_dump()
+                candidate["citations"] = [{k: getattr(c, k) for k in ("evidence_id", "start_line", "end_line", "claim_ids")}
+                                          for c in answer.citations]
+                self.review_input = {"candidate_revision": candidate_revision(answer), "candidate": candidate,
+                                     "risks": risks, "review_is_advisory": True}
+                self.repair_feedback = None
+                self.repair_notice = ""
+                self.trace.append({"event": "content_review_triggered", "risks": risks,
+                                   "thinking": getattr(self.session.adapter, "native_thinking", "default"),
+                                   "output_limit": self.limits.content_review_output_tokens})
+                self.pending_response = None
+                self.checkpoint("ready")
+                try:
+                    review = self.request("review").review
+                except ModelServiceError as error:
+                    if error.code in {"immutable_evidence_changed", "evidence_view_mismatch", "evidence_namespace_mismatch"}:
+                        raise
+                    if error.code not in {"invalid_model_response", "unexpected_model_response", "model_output_truncated",
+                                          "unsupported_reasoning_option", "model_context_exceeded", "output_tokens"} and not isinstance(error, ModelBudgetError):
+                        raise
+                    self.session.ensure_healthy()
+                    return self.review_warning("review_unavailable:" + error.code)
+                return self.apply_content_review(review)
             return self.finish(answer)
         self.guard()
         if self.usage.model_requests >= self.limits.max_model_requests:
-            raise StopExecution("BUDGET_EXCEEDED", "citation_repair_budget")
+            return self.deliver_candidate("citation_repair_budget")
         feedback = self.repair_policy.next_action(answer, issues, self.state.evidence)
         if feedback is None:
-            raise StopExecution("FAILED", "citation_repair_no_progress")
+            return self.deliver_candidate("citation_repair_no_progress")
         self.repair_feedback = feedback
         candidate_ids = {c.evidence_id for c in answer.citations}
         self.evidence_manager.protect(e.evidence_id for e in self.state.evidence if e.evidence_id in candidate_ids)
@@ -1016,9 +1149,72 @@ class Execution:
         self.checkpoint("ready")
         return None
 
+    def should_review(self, answer):
+        return (self.mode == "agent" and self.limits.content_review_enabled
+                and getattr(self.session.adapter, "content_review", False)
+                and not self.state.semantic_review_done
+                and self.limits.max_model_requests - self.usage.model_requests >= 1
+                and bool(review_risks(answer, self.state, self.finalization_reason, self.repair_feedback)))
+
+    def review_warning(self, reason, concerns=(), *, major=False):
+        self.review_input = None
+        self.pending_response = None
+        self.repair_feedback = None
+        self.trace.append({"event": "content_review_unresolved", "reason": reason,
+                           "concerns": list(concerns), "major": major})
+        answer = self.last_candidate.model_copy(deep=True)
+        labels = {"review_unavailable": "本次未取得有效复核结果", "local_patch_rejected": "局部修改未通过核对，未应用该修改",
+                  "review_followup_budget": "补充调查额度已用尽", "review_evidence_unavailable": "尚缺关键证据，无法继续补充",
+                  "review_cannot_apply_locally": "问题超过本次局部修改范围", "stale_review_candidate": "复核针对的回答版本已变化",
+                  "review_interrupted_no_repeat": "复核中断，本次没有重复调用"}
+        answer.limitations.append("内容复核未完全解决，保留原回答：" + labels.get(reason.split(":", 1)[0], "仍有待核实问题"))
+        answer.limitations.extend(concerns)
+        if major:
+            answer.answer_status = "insufficient_evidence"
+        self.answer_evidence = self.last_candidate_evidence
+        return self.finish(answer)
+
+    def apply_content_review(self, review):
+        self.trace.append({"event": "content_review", "verdict": review.verdict,
+                           "concerns": review.concerns, "semantic_proof": False})
+        self.state.investigation.review_concerns = review.concerns
+        self.pending_response = None
+        if self.last_candidate is None or review.candidate_revision != candidate_revision(self.last_candidate):
+            return self.review_warning("stale_review_candidate")
+        if review.verdict == "revise":
+            # Auxiliary source projections do not change the investigation's hot/cold view.
+            # Patches are nevertheless restricted to what this review actually received.
+            sources = ModelRequest.model_validate_json(self.prepared_identity["request_json"]).evidence
+            try:
+                revised = apply_review_patch(self.last_candidate, review, sources)
+            except ValueError as error:
+                return self.review_warning("local_patch_rejected:" + str(error), review.concerns,
+                                           major=review.severity == "major")
+            self.trace.append({"event": "content_review_patch_applied", "candidate_revision": review.candidate_revision})
+            self.review_input = None
+            self.answer_evidence = sources
+            return self.accept_candidate(revised)
+        if (review.verdict == "needs_evidence" and not self.finalization_reason
+                and self.limits.content_review_followup_models >= 2 and self.limits.content_review_followup_tools > 0
+                and self.limits.max_model_requests - self.usage.model_requests >= 2
+                and self.usage.tool_calls < self.limits.max_tool_calls):
+            self.review_input = None
+            self.state.review_followup_models_left = self.limits.content_review_followup_models
+            self.state.review_followup_tools_left = self.limits.content_review_followup_tools
+            self.state.investigation.strategy_hint = "只补读或修订内容复核列出的缺口，保留其他结论：" + "；".join(review.concerns)
+            self.checkpoint("ready")
+            return None
+        if review.verdict == "needs_evidence":
+            return self.review_warning("review_evidence_unavailable", review.concerns, major=True)
+        if review.verdict == "unresolved":
+            return self.review_warning("review_cannot_apply_locally", review.concerns, major=review.severity == "major")
+        self.review_input = None
+        self.answer_evidence = self.last_candidate_evidence
+        return self.finish(self.last_candidate)
+
     def _publication_facts(self):
         return dict(
-            schema_version="result-v2",
+            schema_version="result-v3",
             repository_access=self.repository_access(),
             task_id=self.task_id,
             workspace=self.query.workspace,
@@ -1092,8 +1288,28 @@ class Execution:
         返回Result；构造阶段的异常不在本方法try范围内。
         """
         try:
+            if self.completed_result is not None:
+                self.guard()
+                self.session.ensure_healthy()
+                self.tools.verify()
+                self.trace.append({"event": "result_restored_without_generation"})
+                self.completed_result.trace = self.trace.copy()
+                return self.completed_result
             if not self.initial_complete:
-                self.prepare(prepared)
+                if self.mode == "agent" and prepared is None and getattr(self.session.adapter, "native_first", False):
+                    self.initial_complete = True
+                    self.trace.append({"event": "investigation_started", "bootstrap": "native_tools", "goal": self.query.question})
+                    self.checkpoint("ready")
+                else:
+                    self.prepare(prepared)
+            if self.pending_response and self.pending_response.kind == "review":
+                result = self.apply_content_review(self.pending_response.review)
+                if result:
+                    return result
+            elif self.review_input is not None and self.last_candidate is not None:
+                self.session.ensure_healthy()
+                # A started optional review is never dispatched again after interruption.
+                return self.review_warning("review_interrupted_no_repeat")
             if self.mode == "baseline":
                 if self.finalization_reason == "tool_calls" and not self.state.evidence:
                     raise StopExecution("BUDGET_EXCEEDED", "tool_calls")
@@ -1110,6 +1326,8 @@ class Execution:
                 else:
                     response = self.pending_response if self.pending_response and self.pending_response.kind != "plan" else self.request("act")
                 if self.source_failure and response.kind not in {"answer", "citation_patch"}:
+                    if self.recover_protocol("tool_requested_after_source_stop"):
+                        continue
                     raise StopExecution("FAILED", "tool_requested_after_source_stop")
                 if response.kind in {"answer", "citation_patch"}:
                     result = self.accept_response(response)
@@ -1128,8 +1346,13 @@ class Execution:
                     or len(set(ids)) != len(ids)
                     or set(ids) & set(self.state.call_ids)
                 ):
+                    if self.recover_protocol("invalid_call_id"):
+                        continue
                     raise StopExecution("FAILED", "invalid_call_id")
-                if len(calls) > self.limits.max_tool_calls - self.usage.tool_calls:
+                allowed_calls = self.limits.max_tool_calls - self.usage.tool_calls
+                if self.state.review_followup_tools_left is not None:
+                    allowed_calls = min(allowed_calls, self.state.review_followup_tools_left)
+                if len(calls) > allowed_calls:
                     self.pending_response = None
                     self.stop_retrieval("tool_calls")
                     continue
@@ -1163,7 +1386,13 @@ class Execution:
                     self.observe(call, self.invoke(call))
                     after_ids = {e.evidence_id for e in self.evidence_manager.select("")}
                     coverage = next((t for t in reversed(self.trace[trace_start:]) if t["event"] == "evidence_coverage"), {})
-                    fresh = (coverage.get("new_lines", 0) > 0 if call.name == "read_file" else not seen and call.name != "expand_evidence")
+                    fresh = (coverage.get("new_lines", 0) > 0 if call.name == "read_file" else not seen and call.name not in {"expand_evidence", "update_task"})
+                    objective = call.arguments.get("verification_of")
+                    verify_key = json.dumps([objective, call.name, params, self.tools.generations()], sort_keys=True)
+                    if (objective in {o.objective_id for o in self.state.investigation.objectives}
+                            and verify_key not in self.state.verification_attempts):
+                        self.state.verification_attempts.append(verify_key)
+                        batch_recovered.append("verification:" + verify_key)
                     batch_fresh |= fresh
                     if after_ids - before_ids and not fresh:
                         batch_recovered.append(signature)
@@ -1176,14 +1405,26 @@ class Execution:
                 if batch_fresh:
                     self.state.consecutive_no_progress = 0
                     self.state.recovered_signatures = []
+                    self.state.strategy_recovery_used = False
+                    self.state.investigation.strategy_hint = None
                 elif any(s not in self.state.recovered_signatures for s in batch_recovered):
                     self.state.recovered_signatures = list(dict.fromkeys(self.state.recovered_signatures + batch_recovered))
                 else:
                     self.state.consecutive_no_progress += 1
                 if self.state.consecutive_no_progress >= 2:
-                    self.stop_retrieval("no_progress")
+                    if not self.state.strategy_recovery_used:
+                        self.state.strategy_recovery_used = True
+                        self.state.consecutive_no_progress = 0
+                        self.state.investigation.strategy_hint = "近期动作未改变来源、覆盖或阅读视图。请明确待核事实，换定位方式／连续结构视图，或交付已支持内容与缺口；不要纯重复。"
+                        self.trace.append({"event": "investigation_strategy_recovery", "action": "bounded_strategy_feedback"})
+                    else:
+                        self.stop_retrieval("no_progress")
                 self.checkpoint("ready")
         except StopExecution as error:
+            if error.reason == "content_review_followup" and self.last_candidate is not None:
+                return self.review_warning("review_followup_budget", self.state.investigation.review_concerns, major=True)
+            if error.reason in {"citation_patch_invalid", "citation_repair_no_progress", "citation_repair_budget", "invalid_call_id", "tool_requested_after_finalization", "context_no_summary_budget", "context_protected_content", "context_summary_input", "context_no_progress"} and self.last_candidate is not None:
+                return self.deliver_or_fail(error.reason)
             return self.failed(error.status, error.reason)
         except ModelCancelledError:
             return self.failed("CANCELLED", "cancelled")
@@ -1194,6 +1435,9 @@ class Execution:
         except ModelBudgetError as error:
             return self.failed("BUDGET_EXCEEDED", error.code)
         except ModelServiceError as error:
+            if error.code in {"invalid_model_response", "invalid_model_tool_arguments", "unexpected_model_response", "invalid_summary_provenance"} and self.last_candidate is not None:
+                self.session.ensure_healthy()
+                return self.deliver_or_fail(error.code)
             if error.code == "model_output_truncated":
                 return self.failed("BUDGET_EXCEEDED", "output_tokens")
             return self.failed("FAILED", error.code)
