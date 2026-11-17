@@ -13,6 +13,7 @@ from repoagent.repositories.sources import (
     source_text,
 )
 from repoagent.repositories.tools import CursorStale, RepositoryTools, tool_for
+from repoagent.tools.search import search_spec
 from repoagent.tools.store import (
     MAX_RESULT_BYTES,
     ToolParameterError,
@@ -117,9 +118,20 @@ class WorkspaceTools:
         return self._tool(repo_id).list_directory(**params) | self._identity(repo_id)
 
     def search_code(self, *, repo_id=None, **params):
+        params = self._search_params(params)
         return self._search("search_code", repo_id, params)
 
+    @staticmethod
+    def _search_params(params):
+        params = dict(params)
+        spec = {key: params.pop(key) for key in ("queries", "kind", "path", "output_mode") if key in params}
+        try:
+            return params | search_spec(**spec)
+        except (ValueError, TypeError) as error:
+            raise ToolParameterError(str(error)) from None
+
     def get_symbol(self, *, repo_id=None, **params):
+        params.setdefault("path", None)
         return self._search("get_symbol", repo_id, params)
 
     def clipped_cursor(self, call, items):
@@ -127,21 +139,17 @@ class WorkspaceTools:
         cursor = params.pop("cursor", 0)
         params.pop("limit", None)
         repository = params.pop("repo_id", None)
-        if repository is not None and isinstance(
-            self.tools[repository], RepositoryTools
-        ):
-            if call.name == "search_code":
-                params.setdefault("kind", "text")
-            else:
-                params.setdefault("path", None)
+        if call.name == "search_code":
+            params = self._search_params(params)
+        else:
+            params.setdefault("path", None)
+        if repository is not None:
             offset = (
-                json.loads(base64.urlsafe_b64decode(cursor))["offset"] if cursor else 0
+                json.loads(base64.urlsafe_b64decode(cursor))["offset"] if isinstance(cursor, str) else cursor
             )
             return self.tools[repository].cursor_for_offset(
                 call.name, params, offset + len(items)
             )
-        if repository is not None:
-            return cursor + len(items)
         names = sorted(self.tools)
         if cursor:
             saved = json.loads(base64.urlsafe_b64decode(cursor))
@@ -167,7 +175,7 @@ class WorkspaceTools:
         if repo_id is not None:
             if not isinstance(self._tool(repo_id), RepositoryTools) and not isinstance(
                 params.get("cursor", 0), int
-            ):
+            ) and method != "search_code":
                 raise ToolParameterError("Scoped cursor must be an integer")
             result = getattr(self._tool(repo_id), method)(**params)
             identity = self._identity(repo_id)
@@ -204,13 +212,9 @@ class WorkspaceTools:
         for n in names:
             try:
                 pages[n] = getattr(self.tools[n], method)(
-                **params,
-                limit=limit,
-                cursor=(
-                    self.tools[n].cursor_for_offset(method, params, offsets[n])
-                    if isinstance(self.tools[n], RepositoryTools)
-                    else offsets[n]
-                ),
+                    **params,
+                    limit=limit,
+                    cursor=self.tools[n].cursor_for_offset(method, params, offsets[n]),
                 )
             except GitHubError as error:
                 if error.code not in SOURCE_RESTRICTION_ERRORS:
@@ -226,6 +230,10 @@ class WorkspaceTools:
             "next_cursor": None,
             "source_restrictions": dict(self.restrictions),
         }
+        if method == "search_code":
+            # Each repository keeps its own coverage/count unit; missing sources never count as zero.
+            keys = ("kind", "output_mode", "path_filter", "match_count", "file_count", "count_scope", "match_unit")
+            result["search_summary"] = {n: {k: pages[n][k] for k in keys if k in pages[n]} for n in names}
         for n, page in pages.items():
             result["limitations"].extend(
                 f"{n}: {text}" for text in page.get("limitations", [])

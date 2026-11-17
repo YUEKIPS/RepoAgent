@@ -1,13 +1,15 @@
 {
   "kind": "development-source-snapshot",
-  "version": "0.14.4",
-  "local_source_commit": "4e8088b56ba7d1361b2f1dfed8666d0635aaa7f6",
-  "wheel_sha256": "0b44c0dac4ef147b39e2aa53f19143220c6ef73a6483572f93f51f4ae66df641",
+  "version": "0.14.5",
+  "local_source_commit": "501431030fe7e1e1a6319391df3a27438c0b3ccb",
+  "wheel_sha256": "4b1c88c9250e45cfbd1cb6147997377d8c859488210d05db6b071e1016a66676",
   "execution": "v41",
   "prompt": "v26",
-  "tools": "v16",
-  "package_resources": 100,
-  "data_directory": "work/web-snapshot-0.14.4",
+  "tools": "v17",
+  "package_resources": 101,
+  "data_directory": "work/web-snapshot-0.14.5",
   "data_migration": false,
-  "project_license_not_selected": true
+  "project_license_not_selected": true,
+  "public_export_date": "2026-11-18",
+  "verification": "Package resources match frozen tested wheel; offline source/CLI/config checks, no live API requests"
 }

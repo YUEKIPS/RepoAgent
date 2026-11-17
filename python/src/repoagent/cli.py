@@ -30,6 +30,14 @@ from repoagent.snapshots.repository import build_snapshot, verify_snapshot
 from repoagent.tools.store import SnapshotTools
 
 
+def search_cursor(value):
+    """Preserve legacy numeric offsets while accepting query-bound search cursors."""
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 def main(argv: list[str] | None = None) -> int:
     """解析argv并分发命令，输出JSON，返回进程退出码。
 
@@ -103,9 +111,11 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--snapshot", type=Path, required=True)
         if name in {"search", "symbols", "ls"}:
             command.add_argument("--limit", type=int, default=20)
-            command.add_argument("--cursor", type=int, default=0)
+            command.add_argument("--cursor", type=search_cursor if name == "search" else int, default=0)
         if name == "search":
             command.add_argument("--query", action="append", required=True)
+            command.add_argument("--path")
+            command.add_argument("--output-mode", choices=["content", "files_with_matches", "count"], default="content")
             command.add_argument(
                 "--kind", choices=["text", "path", "symbol"], default="text"
             )
@@ -248,7 +258,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command != "parse-java":
             tools = SnapshotTools(args.snapshot)
             if args.command == "search":
-                data = tools.search_code(args.query, args.kind, args.limit, args.cursor)
+                data = tools.search_code(args.query, args.kind, args.limit, args.cursor,
+                                         path=args.path, output_mode=args.output_mode)
             elif args.command == "read":
                 data = tools.read_file(args.path, args.start, args.end, args.column)
             elif args.command == "symbols":

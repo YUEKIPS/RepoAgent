@@ -21,13 +21,14 @@ from repoagent.tools.registry import (
     navigation_preview,
     preserve,
 )
+from repoagent.tools.search import search_spec
 from repoagent.tools.store import (
     SnapshotTools,
     ToolParameterError,
     ToolUnreadablePathError,
 )
 
-SCHEMA_VERSION = "registered-tools-v16-guidance-placement"
+SCHEMA_VERSION = "registered-tools-v17-scoped-search"
 
 
 # 分页参数：limit限制每页项数，cursor为下一页偏移，不接受bool冒充整数。
@@ -63,12 +64,14 @@ class DirectoryArgs(PageArgs):
 class SearchArgs(PageArgs):
     queries: list[str] = Field(min_length=1, max_length=3)
     kind: Literal["text", "path", "symbol"] = "text"
+    path: str | None = None
+    output_mode: Literal["content", "files_with_matches", "count"] = "content"
 
     @model_validator(mode="after")
     def nonblank(self):
         """拒绝空白或过长的查询词，成功返回self；不将字符串作为正则执行。"""
-        if any(not q.strip() or len(q) > 512 for q in self.queries):
-            raise ValueError("Invalid search query")
+        spec = search_spec(self.queries, self.kind, self.path, self.output_mode)
+        self.queries, self.path = spec["queries"], spec["path"]
         return self
 
 
@@ -144,7 +147,7 @@ DESCRIPTIONS = {
     "outline_file": "File declaration outline and total lines, navigation only. Shows indexed types/functions/methods and their ranges; text_only is not an exhaustive outline. Use read_file for source. Paginate next_cursor.",
     "expand_evidence": "Request original evidence_ids from this task for the next model input. Already visible IDs are idempotent; cold IDs are restored locally. Or supply only catalog_cursor to page the non-citable catalog. Only IDs in the actual next input's citation_policy are citable. On context_capacity request fewer IDs, or use read_file with a smaller whole-line range to create a new immutable fragment. Does not fetch another repository or version.",
     "list_directory": "列当前快照目录；排除文件可见不代表可读。按next_cursor分页。",
-    "search_code": "Literal search: text=source text (case-preserving matches preferred), path=file path, symbol=indexed type/method identifier (not fields). Multiple queries are merged round-robin by their own relevance. Use text for field names/annotations. No matches do not prove absence; paginate with next_cursor. At most 3 queries per call; no path filter parameter. Respect returned size and pagination boundaries.",
+    "search_code": "Literal search: text=source text (case-preserving matches preferred), path=file path, symbol=indexed type/method identifier (not fields). At most 3 queries per call, trimmed and merged round-robin by their own relevance. Optional path restricts to an exact file or directory subtree; omit for global search. output_mode: content (default) returns navigation snippets; files_with_matches returns unique paths; count returns matching-line/file/declaration counts per file, not occurrences. Counts cover only count_scope, never imply whole-repository absence. Use text for field names/annotations. Follow next_cursor with the same query, kind, path and mode. Source identities may be grouped in sources by repo_id; preserve hit repo_id for subsequent reads. Search results are navigation, not citable source.",
     "read_file": "只读原文，最多200行/16KiB。省略end_line从起点读至容量边界；或指定symbol读取该文件唯一声明。range_complete仅表示请求范围完成，at_eof仅表示到了文件尾，不等于已读整个文件或必要结构。关注总行数和截断原因；按continuation续本次范围，next_file_range提示文件后续；半行不可引。verification_of可关联本次待核事项。",
     "get_symbol": "Exact bare symbol name (e.g. a type name, no 'class ' prefix). Omit path for global lookup; optional path is an EXACT FILE, never a directory. Returns candidate locations, not source text or a call graph.",
 }
@@ -261,6 +264,7 @@ class Dispatcher:
                 not getattr(self.tools, "allows_routing", False)
                 and isinstance(self.tools, SnapshotTools)
                 and isinstance(params.get("cursor", 0), str)
+                and call.name != "search_code"
             ):
                 raise ToolParameterError("Single snapshot cursor must be an integer")
             if self.registry.spec(call.name).origin == "builtin" and "repo_id" in params and not getattr(self.tools, "allows_routing", False):

@@ -12,6 +12,16 @@ from repoagent.repositories.sources import (
     SnapshotLease,
     source_text,
 )
+from repoagent.tools.search import (
+    declaration_hits,
+    enclosing_types,
+    file_hits,
+    in_scope,
+    path_hit,
+    rank_hits,
+    search_output,
+    search_spec,
+)
 from repoagent.tools.store import (
     MAX_RESULT_BYTES,
     SnapshotTools,
@@ -101,7 +111,7 @@ class RepositoryTools:
     def cursor_for_offset(self, method, params, offset):
         if not offset:
             return 0
-        key = [method, params]
+        key = [method, search_spec(**params) if method == "search_code" else params]
         signature = hashlib.sha256(
             json.dumps([self.source.version, key], sort_keys=True).encode()
         ).hexdigest()
@@ -148,70 +158,38 @@ class RepositoryTools:
             cursor,
         )
 
-    def search_code(self, queries, kind="text", limit=20, cursor=0):
-        if (
-            kind not in {"path", "text", "symbol"}
-            or not 1 <= len(queries) <= 3
-            or any(
-                not isinstance(q, str) or not q.strip() or len(q) > 512 for q in queries
-            )
-        ):
-            raise ToolParameterError("Invalid search query")
-        rows, terms = [], [q.casefold() for q in queries]
+    def search_code(self, queries, kind="text", limit=20, cursor=0, path=None, output_mode="content"):
+        try:
+            spec = search_spec(queries, kind, path, output_mode)
+        except ValueError as error:
+            raise ToolParameterError(str(error)) from None
+        hits, symbols = [], []
         if kind == "path":
-            for e in self.source.store.entries(self.source.version):
-                if e["policy"] == "allowed" and any(
-                    t in e["path"].casefold() for t in terms
-                ):
-                    rows.append(
-                        {
-                            "path": e["path"],
-                            "start_line": 1,
-                            "end_line": 1,
-                            "status": e["parse_state"],
-                            "score": sum(t in e["path"].casefold() for t in terms),
-                        }
-                    )
+            for entry in self.source.store.entries(self.source.version):
+                if entry["policy"] != "allowed" or not in_scope(entry["path"], spec["path"]):
+                    continue
+                hit = path_hit(entry["path"], spec["queries"])
+                if hit:
+                    hits.append(hit | {"status": entry["parse_state"]})
         else:
-            for path, state, symbols in self.source.store.indexed(self.source.version):
+            for file, state, declarations in self.source.store.indexed(self.source.version):
+                if not in_scope(file, spec["path"]):
+                    continue
+                symbols.extend(declarations)
                 if kind == "symbol":
-                    rows.extend(
-                        s | {"score": 1}
-                        for s in symbols
-                        if any(t in s["name"].casefold() for t in terms)
-                    )
+                    hits.extend(declaration_hits(declarations, spec["queries"]))
                 else:
-                    data = self.source.store.cached(
-                        self.source.version, path, self.source.context.owner
-                    )
+                    data = self.source.store.cached(self.source.version, file, self.source.context.owner)
                     if data is None:
                         raise GitHubError("indexed_content_unavailable")
-                    for number, line in enumerate(
-                        source_lines(
-                            self.source.store.text_view(
-                                self.source.version, path, data
-                            ).text
-                        ),
-                        1,
-                    ):
-                        if any(t in line.casefold() for t in terms):
-                            rows.append(
-                                {
-                                    "path": path,
-                                    "start_line": number,
-                                    "end_line": number,
-                                    "snippet": line[:400],
-                                    "score": sum(t in line.casefold() for t in terms),
-                                }
-                            )
-        rows.sort(key=lambda r: (-r.get("score", 0), r["path"], r["start_line"]))
-        return self._page(
-            rows,
-            self._base(),
-            limit,
-            cursor,
-            ["search_code", {"queries": queries, "kind": kind}],
-        )
+                    text = self.source.store.text_view(self.source.version, file, data).text
+                    hits.extend(file_hits(file, text, spec["queries"]))
+        hits = rank_hits(hits, len(spec["queries"]))
+        rows, metadata = search_output(hits, spec, "fixed_allowed_catalog" if kind == "path" else "cached_indexed_files")
+        # Add the same structural navigation hints as local search, never source evidence.
+        if output_mode == "content":
+            enclosing_types(rows, symbols)
+        return self._page(rows, self._base() | metadata, limit, cursor, ["search_code", spec])
 
     def get_symbol(self, name, path=None, limit=20, cursor=0):
         if not name.strip() or len(name) > 512:

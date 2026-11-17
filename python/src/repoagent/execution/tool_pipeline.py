@@ -3,6 +3,7 @@
 from repoagent.execution.contracts import Observation, ToolCall, ToolOutcome
 from repoagent.execution.control import StopExecution
 from repoagent.repositories.text import TEXT_ERRORS
+from repoagent.tools.registry import compact_navigation
 
 
 class ToolPipeline:
@@ -28,6 +29,8 @@ class ToolPipeline:
         if outcome.ok and (not self.registry or self.registry.spec(call.name).origin == "builtin"):
             normalizer = self.registry.spec(call.name).normalizer if self.registry else None
             data = normalizer(outcome.result) if normalizer else outcome.result.copy()
+            if call.name in {"search_code", "get_symbol", "list_directory", "outline_file"}:
+                data = compact_navigation(data)
             # 固定快照身份已在query/Evidence中；完整原始工具结果仍保留trace。
             for key in ("snapshot_id", "commit", "state", "coverage"):
                 data.pop(key, None)

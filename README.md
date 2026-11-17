@@ -4,18 +4,22 @@
 
 RepoAgent 是一个在本地运行的代码仓库问答工具。添加公开 GitHub 仓库后，可以询问功能实现、调用流程或异常条件，并通过回答中的文件路径、行号和源码片段核对结论。也可以选定多个仓库，分析前后端接口或不同项目之间的协作关系。
 
-版本：**0.14.4开发快照**。
+版本：**0.14.5开发快照**。
 
 ### 本快照
 
-这是内部开发基线0.14.4的可复现源码快照，既有公开v1.1.0和默认分支保持。
+这是0.14.5／工具协议v17的开发源码快照，既有公开v1.1.0和旧快照保留。
 
 - 多语言声明索引、文件范围与结构概览。
 - 具体风险触发的有界复核、局部修订与安全上下文。
 - 统一任务思考配置、请求级计量及未知用量保护。
-- 工具说明归位，回答保留固定版本证据；质量提升仍需独立评测。
+- 搜索支持文件／目录范围，以及内容、文件列表和计数三种返回模式。
+- 本地与GitHub按需搜索共用匹配逻辑，导航反馈合并重复来源身份，原始结果仍保留审计。
+- 主提示、Agent循环、复核触发与预算保持；成本和准确性不承诺固定提升。
 
-使用独立数据目录work/web-snapshot-0.14.4，不加载旧公开版数据库。凭据和数据不随源码交付。
+参数、分页和证据边界见[工具协议v17](TOOL-CONTRACT.md)。
+
+使用独立数据目录work/web-snapshot-0.14.5，不加载旧公开版数据库。凭据和数据不随源码交付。
 
 ## 可以用它做什么
 
@@ -83,7 +87,7 @@ DEEPSEEK_API_KEY=你的API密钥
 ### 3. 启动
 
 ```powershell
-.\.venv\Scripts\python.exe -m repoagent.web --model-config config/model.json --env-file .env --initial-model-source live --output-dir work/web-snapshot-0.14.4 --usage-ledger work/web-snapshot-0.14.4/usage.sqlite3 --port 8765
+.\.venv\Scripts\python.exe -m repoagent.web --model-config config/model.json --env-file .env --initial-model-source live --output-dir work/web-snapshot-0.14.5 --usage-ledger work/web-snapshot-0.14.5/usage.sqlite3 --port 8765
 ```
 
 在浏览器打开 **http://127.0.0.1:8765/**。按 `Ctrl+C` 停止；再次使用同一命令启动即可沿用数据。端口已被占用时，可把 `--port` 改为其他空闲端口。
@@ -102,7 +106,7 @@ DEEPSEEK_API_KEY=你的API密钥
 ## 不配置密钥，先看界面
 
 ```powershell
-.\.venv\Scripts\python.exe -m repoagent.web --mock-script examples/offline.json --output-dir work/offline-snapshot-0.14.4 --port 8766
+.\.venv\Scripts\python.exe -m repoagent.web --mock-script examples/offline.json --output-dir work/offline-snapshot-0.14.5 --port 8766
 ```
 
 打开 **http://127.0.0.1:8766/**。此模式使用预设响应，不具备任意问题的理解能力，也不调用模型；初始仓库池为空。主动添加仓库仍会访问 GitHub。
@@ -125,7 +129,7 @@ GitHub 令牌和模型密钥应分别配置。令牌不会将产品的访问范�
 
 ## 数据与隐私
 
-- 对话、源码缓存、引用、检查点和用量记录保存在启动命令指定的 `work/web-snapshot-0.14.4` 中，不包含在本仓库中。
+- 对话、源码缓存、引用、检查点和用量记录保存在启动命令指定的 `work/web-snapshot-0.14.5` 中，不包含在本仓库中。
 - 备份前先停止服务，再复制完整数据目录；不同服务不要共用一个数据目录。
 - 不要提交 `.env`、实际配置、运行数据或日志；项目的 `.gitignore` 已排除常见路径。
 - 升级时使用与版本匹配的数据目录；本版不自动迁移旧版本数据库。

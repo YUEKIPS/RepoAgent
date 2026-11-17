@@ -4,6 +4,8 @@
 命中列表只是候选，只有执行层实际提供的完整源码行才能作为回答证据。
 """
 
+import base64
+import hashlib
 import json
 import sqlite3
 from contextlib import closing
@@ -11,6 +13,17 @@ from pathlib import Path
 from urllib.parse import quote
 
 from repoagent.snapshots.repository import READABLE, safe_relative, verify_snapshot
+from repoagent.tools.search import (
+    declaration_hits,
+    enclosing_types,
+    file_hits,
+    in_scope,
+    path_hit,
+    rank_hits,
+    search_output,
+    search_spec,
+    source_lines,
+)
 
 MAX_RESULT_BYTES = 32 * 1024
 
@@ -33,22 +46,6 @@ def integer(value: int, minimum: int, maximum: int) -> int:
 def json_size(value: dict) -> int:
     """返回value字典序列化后的UTF-8字节数，用于整个工具响应大小限制。"""
     return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
-
-
-def source_lines(text: str) -> list[str]:
-    """按LF分割text并保留换行，返回原文行列表。
-
-    不使用splitlines，防止Unicode分隔符被误算成源码换行；CRLF原样保留。
-    """
-    parts = text.split("\n")
-    return [part + "\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
-
-
-def symbol_match(row: dict, term: str) -> int:
-    """计算row声明对规范化term的匹配分：精确名/限定名为3，子串为1，否则0。"""
-    qualified = f"{row['owner']}.{row['name']}" if row["owner"] else row["name"]
-    names = [row["name"].casefold(), qualified.casefold()]
-    return 3 if term in names else int(any(term in name for name in names))
 
 
 class SnapshotTools:
@@ -143,169 +140,63 @@ class SnapshotTools:
             cursor,
         )
 
-    def search_code(
-        self,
-        queries: str | list[str],
-        kind: str = "text",
-        limit: int = 20,
-        cursor: int = 0,
-    ) -> dict:
-        """按queries在text/path/symbol中做确定性字面检索，返回分页命中。
-
-        支持1～3词；符号精确匹配优先，文本原大小写命中加分，多词轮流合并避免互相挤占。
-        每页补所属类型位置便于读取字段/注解上下文；命中不代表完整调用图或语义检索。
-        """
-        if kind not in {"text", "path", "symbol"}:
-            raise ValueError("Search kind must be text, path or symbol")
-        queries = [queries] if isinstance(queries, str) else queries
-        if not isinstance(queries, list) or not 1 <= len(queries) <= 3:
-            raise ValueError("Expected 1 to 3 search queries")
-        if any(
-            not isinstance(q, str) or not q.strip() or len(q) > 512 for q in queries
-        ):
-            raise ValueError("Queries must be nonempty strings up to 512 characters")
-        terms = [q.strip().casefold() for q in queries]
-        integer(limit, 1, 100)
-        integer(cursor, 0, 2**31 - 1)
+    def cursor_for_offset(self, method, params, offset):
+        integer(offset, 0, 2**31 - 1)
+        if method != "search_code":
+            return offset
+        spec = search_spec(**params)
+        if not offset or (spec["path"] is None and spec["output_mode"] == "content"):
+            return offset
         _, base = self._context()
+        key = hashlib.sha256(json.dumps([base["snapshot_id"], base["commit"], spec], sort_keys=True).encode()).hexdigest()
+        return base64.urlsafe_b64encode(json.dumps(dict(key=key, offset=offset)).encode()).decode()
+
+    def _search_offset(self, cursor, spec, base):
+        if isinstance(cursor, str):
+            try:
+                saved = json.loads(base64.urlsafe_b64decode(cursor))
+                key = hashlib.sha256(json.dumps([base["snapshot_id"], base["commit"], spec], sort_keys=True).encode()).hexdigest()
+                if saved["key"] != key:
+                    raise ValueError()
+                return integer(saved["offset"], 0, 2**31 - 1)
+            except (ValueError, TypeError, KeyError):
+                raise ToolParameterError("Cursor belongs to another query/source") from None
+        return integer(cursor, 0, 2**31 - 1)
+
+    def search_code(self, queries, kind="text", limit=20, cursor=0, path=None, output_mode="content"):
+        """Literal search within readable fixed-source files; output pages are mode-specific."""
+        try:
+            spec = search_spec(queries, kind, path, output_mode)
+            integer(limit, 1, 100)
+        except ValueError as error:
+            raise ToolParameterError(str(error)) from None
+        _, base = self._context()
+        offset = self._search_offset(cursor, spec, base)
         hits = []
         with closing(self._connect()) as db:
-            symbols = [dict(row) for row in db.execute("SELECT * FROM symbols")]
+            symbols = [dict(row) for row in db.execute("SELECT * FROM symbols")
+                       if in_scope(row["path"], spec["path"])]
             if kind == "symbol":
-                for row in symbols:
-                    score = sum(symbol_match(row, term) for term in terms)
-                    if score:
-                        hits.append(
-                            dict(row)
-                            | {
-                                "score": score,
-                                "_query_scores": [
-                                    symbol_match(row, term) for term in terms
-                                ],
-                            }
-                        )
+                hits.extend(declaration_hits(symbols, spec["queries"]))
             else:
-                for row in db.execute("SELECT path,text FROM files ORDER BY path"):
-                    if kind == "path":
-                        score = sum(term in row["path"].casefold() for term in terms)
-                        if score:
-                            hits.append(
-                                {
-                                    "path": row["path"],
-                                    "start_line": 1,
-                                    "score": score,
-                                    "_query_scores": [
-                                        int(term in row["path"].casefold())
-                                        for term in terms
-                                    ],
-                                }
-                            )
+                columns = "path" if kind == "path" else "path,text"
+                for row in db.execute(f"SELECT {columns} FROM files ORDER BY path"):
+                    if not in_scope(row["path"], spec["path"]):
                         continue
-                    for number, original_line in enumerate(
-                        source_lines(row["text"]), 1
-                    ):
-                        line = original_line.rstrip("\r\n")
-                        # 文字忽略大小写可召回，保留原大小写的标识命中再加分，减少包名挤占类型声明。
-                        query_scores = [
-                            int(term in line.casefold())
-                            + int(query.strip() in line and query.strip() != term)
-                            for query, term in zip(queries, terms, strict=True)
-                        ]
-                        score = sum(query_scores)
-                        if score:
-                            hits.append(
-                                {
-                                    "path": row["path"],
-                                    "start_line": number,
-                                    "end_line": number,
-                                    "snippet": line[:160],
-                                    "snippet_truncated": len(line) > 160,
-                                    "score": score,
-                                    "_query_scores": query_scores,
-                                }
-                            )
-        hits.sort(
-            key=lambda hit: (
-                -hit["score"],
-                hit["path"],
-                hit["start_line"],
-                hit.get("name", ""),
-            )
-        )
-        if len(terms) > 1:
-            # 每个查询按自身匹配度排序，再轮流合并；宽泛词不能独占top-k。
-            queues = [
-                iter(
-                    sorted(
-                        (hit for hit in hits if hit["_query_scores"][term_index]),
-                        key=lambda hit: (
-                            -hit["_query_scores"][term_index],
-                            hit["path"],
-                            hit["start_line"],
-                            hit.get("name", ""),
-                        ),
-                    )
-                )
-                for term_index in range(len(terms))
-            ]
-            merged, seen = [], set()
-            while len(merged) < len(hits):
-                for queue in queues:
-                    for hit in queue:
-                        identity = (
-                            hit["path"],
-                            hit["start_line"],
-                            hit.get("end_line"),
-                            hit.get("symbol_id"),
-                        )
-                        if identity not in seen:
-                            seen.add(identity)
-                            merged.append(hit)
-                            break
-            hits = merged
-        for hit in hits:
-            hit.pop("_query_scores")
-        # 只为本页命中补所属类型窗口；这只是语法包含关系，不是语义类型解析。
-        types = {}
-        for symbol in symbols:
-            if symbol["kind"] in {
-                "class",
-                "interface",
-                "enum",
-                "record",
-                "annotation_type",
-            }:
-                types.setdefault(symbol["path"], []).append(symbol)
-        for hit in hits[cursor : cursor + limit]:
-            containing = [
-                item
-                for item in types.get(hit["path"], [])
-                if item["start_line"] <= hit["start_line"]
-                and hit.get("end_line", hit["start_line"]) <= item["end_line"]
-            ]
-            if containing:
-                # 嵌套类型取包含范围最小者，便于后续读取最相关的字段/注解上下文。
-                parent = min(
-                    containing,
-                    key=lambda item: (
-                        item["end_line"] - item["start_line"],
-                        item["start_line"],
-                        item["symbol_id"],
-                    ),
-                )
-                hit["enclosing_type_start_line"] = parent["start_line"]
-                hit["enclosing_type_end_line"] = parent["end_line"]
-        return self._page(
-            base
-            | {
-                "kind": kind,
-                "match_count": len(hits),
-                "note": "无匹配不代表功能不存在。",
-            },
-            hits,
-            limit,
-            cursor,
-        )
+                    if kind == "path":
+                        hit = path_hit(row["path"], spec["queries"])
+                        if hit:
+                            hits.append(hit)
+                    else:
+                        hits.extend(file_hits(row["path"], row["text"], spec["queries"]))
+        hits = rank_hits(hits, len(spec["queries"]))
+        rows, metadata = search_output(hits, spec, "prepared_readable_files")
+        if output_mode == "content":
+            enclosing_types(rows[offset:offset + limit], symbols)
+        page = self._page(base | metadata, rows, limit, offset)
+        if page["next_cursor"] is not None:
+            page["next_cursor"] = self.cursor_for_offset("search_code", spec, page["next_cursor"])
+        return page
 
     def get_symbol(
         self, name: str, path: str | None = None, limit: int = 20, cursor: int = 0
