@@ -6,6 +6,11 @@ MAX_RECOVERY_CHARS = 2_000_000
 _FENCE = re.compile(r"\s*```(?:json)?\s*\n(.*)\n```\s*", re.DOTALL)
 
 
+def encode_json(value) -> str:
+    """Serialize UTF-8 JSON text without insignificant whitespace."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 def decode_response_json(content, *, recover_controls=False):
     wrapped = _FENCE.fullmatch(content)
     raw = wrapped.group(1) if wrapped else content

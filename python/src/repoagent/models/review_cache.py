@@ -7,6 +7,7 @@ from copy import deepcopy
 from repoagent.execution.prompt_spec import STABLE_SYSTEM
 from repoagent.models.base import ModelBudgetError
 from repoagent.models.evidence_view import numbered
+from repoagent.models.response_json import encode_json as encoded
 
 TEMPLATE_FIELDS = ("tools", "tool_choice", "response_format")
 PROFILE_FIELDS = ("model", "thinking", "reasoning_effort", "reasoning")
@@ -16,10 +17,6 @@ def cache_profile(payload):
     """Native effort may render before system; messages alone are not a cache key."""
     wire = payload | payload.get("extra_body", {})
     return {field: deepcopy(wire[field]) for field in PROFILE_FIELDS if field in wire}
-
-
-def encoded(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def message_data(message):

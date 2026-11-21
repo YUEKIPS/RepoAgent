@@ -1,4 +1,4 @@
-"""Application execution boundary, independent of HTTP and page state."""
+"""Assemble model and repository dependencies for one execution."""
 
 import inspect
 from dataclasses import dataclass

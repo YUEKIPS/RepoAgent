@@ -12,14 +12,10 @@ from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
-from pydantic import Field
-
-from repoagent.execution.content_review import (
-    apply_review_patch,
-    candidate_revision,
-    review_risks,
-)
-from repoagent.execution.context import ContextBuilder
+from repoagent.execution.context.builder import ContextBuilder
+from repoagent.execution.context.evidence import EvidenceManager
+from repoagent.execution.context.pressure import PressureCoordinator
+from repoagent.execution.context.summary import apply_context_summary
 from repoagent.execution.contracts import (
     AgentState,
     Answer,
@@ -29,7 +25,6 @@ from repoagent.execution.contracts import (
     Observation,
     Query,
     Result,
-    StrictModel,
     ToolCall,
     ToolOutcome,
     Usage,
@@ -38,25 +33,41 @@ from repoagent.execution.contracts import (
 )
 from repoagent.execution.control import StopExecution, estimate
 from repoagent.execution.conversation_session import ConversationSession
-from repoagent.execution.evidence import EvidenceManager, ordered_hits, read_window
-from repoagent.execution.journal import RunJournal
-from repoagent.execution.limits import Limits
-from repoagent.execution.model_session import ModelSession
-from repoagent.execution.notices import LIVE_NOTE
-from repoagent.execution.pressure import PressureCoordinator
-from repoagent.execution.prompt_spec import FORMAT_GUIDANCE
-from repoagent.execution.publication import AnswerPublisher, CitationValidationError
-from repoagent.execution.publication import (
+from repoagent.execution.delivery.content_review import (
+    apply_review_patch,
+    candidate_revision,
+)
+from repoagent.execution.delivery.notices import LIVE_NOTE
+from repoagent.execution.delivery.publication import (
+    AnswerPublisher,
+    CitationValidationError,
+)
+from repoagent.execution.delivery.publication import (
     citations_with_context as citations_with_context,
 )
-from repoagent.execution.publication import validate_citations as validate_citations
-from repoagent.execution.repair import (
-    PatchValidationError,
+from repoagent.execution.delivery.publication import (
+    validate_citations as validate_citations,
+)
+from repoagent.execution.delivery.repair import (
     RepairPolicy,
-    apply_citation_patch,
     full_rewrite_feedback,
     is_citation_patch,
 )
+from repoagent.execution.delivery.workflow import (
+    answer_with_review_warning,
+    can_follow_up,
+    check_citation_patch,
+    review_request,
+)
+from repoagent.execution.journal import RunJournal
+from repoagent.execution.limits import Limits
+from repoagent.execution.model_session import ModelSession
+from repoagent.execution.preparation import (
+    PreparedContext,
+    read_initial_hits,
+    validate_reuse,
+)
+from repoagent.execution.prompt_spec import FORMAT_GUIDANCE
 from repoagent.execution.tool_pipeline import ToolPipeline
 from repoagent.models.base import (
     ModelBudgetError,
@@ -66,34 +77,14 @@ from repoagent.models.base import (
     ProviderAdapter,
 )
 from repoagent.repositories.navigation import catalog_hints
-from repoagent.repositories.sources import GitHubSource, descriptor, source_text
+from repoagent.repositories.sources import GitHubSource, source_text
 from repoagent.repositories.text import TEXT_ERRORS
-from repoagent.tools.protocol import SCHEMA_VERSION, Dispatcher, builtin_registry
+from repoagent.tools.dispatch import Dispatcher, builtin_registry
+from repoagent.tools.schema import SCHEMA_VERSION
 from repoagent.tools.store import source_lines
 from repoagent.tools.workspace import SOURCE_RESTRICTION_ERRORS, WorkspaceTools
 
 PROTOCOL_VERSION = "controlled-execution-v41-unified-thinking"
-
-
-# 可配对复用的准备结果：查询、限制、模型ID、证据、用量、轨迹与耗时。
-class PreparedContext(StrictModel):
-    """本机执行器产物，复用时核对查询、配置及证据原文。"""
-
-    query: Query
-    limits: Limits
-    model_id: str
-    generation_id: str | None = None
-    execution_version: str | None = None
-    usage: Usage
-    trace: list[dict]
-    evidence: list[Evidence]
-    limitations: list[str]
-    preparation_seconds: float = Field(ge=0)
-    index_generations: dict = Field(default_factory=dict, exclude_if=lambda v: not v)
-    source_failure: str | None = Field(default=None, exclude_if=lambda v: v is None)
-    observations: list[Observation] = Field(
-        default_factory=list, exclude_if=lambda v: not v
-    )
 
 
 class Execution:
@@ -237,7 +228,6 @@ class Execution:
         self.registry.seal()
         self.dispatcher = Dispatcher(self.tools, self.registry)
         self.trace[0]["registry_fingerprint"] = self.registry.fingerprint
-        self.pressure = PressureCoordinator()
         self.context_compacting = False
         self.pressure_pending = None
         self.force_compact = False
@@ -566,6 +556,75 @@ class Execution:
         self.checkpoint("ready")
         return True
 
+    def _prepare_request_context(self, build):
+        pressure = PressureCoordinator(
+            task_id=self.task_id, query=self.query, session=self.session,
+            history=self.conversation_session, registry=self.registry,
+            limits=self.limits, usage=self.usage, trace=self.trace,
+            checkpoint=self.checkpoint, request_summary=self._request_context_summary,
+            commit_summary=self._commit_context_summary,
+        )
+        try:
+            if self.pressure_pending:
+                if not self.pending_response or self.pending_response.kind != "summary":
+                    raise ModelServiceError(code="context_summary_response_unavailable")
+                self._commit_context_summary(self.pending_response.summary)
+            return pressure.prepare(build, force=self.force_compact)
+        except (StopExecution, ModelServiceError) as error:
+            reason = error.reason if isinstance(error, StopExecution) else error.code
+            recoverable = {"context_no_summary_budget", "context_protected_content", "context_summary_input", "context_no_progress", "invalid_summary_provenance"}
+            if reason not in recoverable or self.minimal_context or self.repair_feedback:
+                raise
+            self.guard()
+            self.session.ensure_healthy()
+            self.session.reset_protocol()
+            self.minimal_context = True
+            self.isolated_finalization = True
+            self.pressure_pending = None
+            self.pending_response = None
+            self.stop_retrieval(reason)
+            self.recovery_events.append({"stage": "context", "reason": reason, "action": "minimal_final_view"})
+            built = build(True)
+            if built.prepared_call.input_size > self.session.max_input or not built.prepared_call.measurement.get("hard_fits", True):
+                self.session.discard(built.prepared_call)
+                raise StopExecution("BUDGET_EXCEEDED", "context_protected_content") from None
+            self.trace.append({"event": "minimal_final_context", "reason": reason,
+                                    "evidence_ids": [e.evidence_id for e in built.message.evidence]})
+            self.checkpoint("context_ready")
+            return built
+
+    def _commit_context_summary(self, result):
+        record, event = apply_context_summary(
+            result, pending=self.pressure_pending, query=self.query,
+            history=self.conversation_session, task_id=self.task_id,
+            session=self.session, registry_fingerprint=self.registry.fingerprint,
+        )
+        self.trace.append(event)
+        self.pending_response = None
+        self.pressure_pending = None
+        self.checkpoint("context_ready")
+        if record and self.summary_sink:
+            self.summary_sink(record)
+
+    def _request_context_summary(self, prepared, kind):
+        request = ModelRequest.model_validate_json(prepared.request_json)
+        material = request.summary_input.model_dump() if kind == "history" else request.runtime_summary_input
+        self.pressure_pending = {"kind": kind, "material": material}
+        self.context_compacting = True
+        self.journal.start("summary")
+        self.trace.append({"event": "summary_request_meter", "measurement": prepared.measurement})
+        previous = len(self.session.records)
+        try:
+            response = self.session.invoke(prepared).response
+            self.journal.responded("summary")
+            self.journal.close("completed")
+            return response
+        finally:
+            self.context_compacting = False
+            for record in self.session.records[previous:]:
+                self.trace.append({"event": "model_usage", "record": record.model_dump()})
+            self.refresh_usage()
+
     def _request_once(self, stage: str) -> ModelResponse:
         """执行一次受控模型请求并返回重新校验的ModelResponse。
 
@@ -613,7 +672,7 @@ class Execution:
             review_input=self.review_input if stage == "review" else None,
             source_capabilities=self.tools.capabilities(),
         )
-        built = self.pressure.prepare(self, build, force=self.force_compact)
+        built = self._prepare_request_context(build)
         self.force_compact = False
         message, prepared_call = built.message, built.prepared_call
         can_use_tools, preparation_count = built.can_use_tools, built.preparation_count
@@ -826,6 +885,9 @@ class Execution:
             raise ValueError("Evidence version mismatch")
         return self.tools.roots[evidence.repo_id]
 
+    def _advance_initial_cursor(self, cursor):
+        self.initial_cursor = cursor
+
     def prepare(self, prepared: PreparedContext | None = None) -> PreparedContext:
         """生成或核验复用的初始准备，返回PreparedContext。
 
@@ -834,26 +896,11 @@ class Execution:
         """
         # 共享准备是宿主产物而非模型输入，必须复核问题/配置和每段原文。
         if prepared is not None:
-            prepared = PreparedContext.model_validate(prepared.model_dump())
-            if (
-                prepared.query != self.query
-                or prepared.limits != self.limits
-                or prepared.model_id != self.model.model_id
-                or prepared.execution_version != PROTOCOL_VERSION
-                or prepared.index_generations != (self.tools.generations())
-            ):
-                raise ValueError("Prepared context binding/configuration mismatch")
-            for evidence in prepared.evidence:
-                text = source_text(self.evidence_root(evidence), evidence.path)
-                original = "".join(
-                    source_lines(text)[evidence.start_line - 1 : evidence.end_line]
-                )
-                if (
-                    evidence.text != original
-                    or evidence.commit
-                    != descriptor(self.evidence_root(evidence)).commit
-                ):
-                    raise ValueError("Prepared evidence mismatch")
+            prepared = validate_reuse(
+                prepared, query=self.query, limits=self.limits, model_id=self.model.model_id,
+                version=PROTOCOL_VERSION, generations=self.tools.generations,
+                evidence_root=self.evidence_root,
+            )
             self.state.evidence = [e.model_copy(deep=True) for e in prepared.evidence]
             self.session.inherit(prepared.usage, prepared.generation_id)
             self.usage.tool_calls = prepared.usage.tool_calls
@@ -905,83 +952,13 @@ class Execution:
         self.initial_hits = hits
         if hits["truncated"]:
             self.limitations.append("初始检索仅取top-k；更多命中未读取。")
-        # 缓存本轮发现的EOF，避免超出文件的窗口被重复读取；最多initial_max_reads次初始读取。
-        known_file_ends = {}
-        initial_reads = sum(o.call.name == "read_file" and o.call.call_id.startswith("initial-") for o in self.state.observations)
-        for cursor, hit in enumerate(ordered_hits(hits["items"], self.query.policy.retrieval_strategy)):
-            if cursor < self.initial_cursor:
-                continue
-            start, end = read_window(
-                hit, search_kind, self.query.policy.retrieval_strategy
-            )
-            self.trace.append(
-                {
-                    "event": "initial_candidate",
-                    "path": hit["path"],
-                    "start_line": start,
-                    "end_line": end,
-                    "strategy": self.query.policy.retrieval_strategy,
-                }
-            )
-            identity = (hit.get("repo_id"), hit["path"])
-            end = min(end, known_file_ends.get(identity, end))
-            key = (hit["path"], start, end)
-            if any(
-                e.repo_id == hit.get("repo_id")
-                and e.path == key[0]
-                and e.start_line <= start
-                and end <= e.end_line
-                for e in self.state.evidence
-            ):
-                self.trace.append(
-                    {
-                        "event": "initial_read_covered",
-                        "path": key[0],
-                        "start_line": start,
-                        "end_line": end,
-                    }
-                )
-                continue
-            # 初始阶段不耗尽全部工具额度；未读候选在limitations中明确，Agent可继续调查。
-            if self.usage.tool_calls >= self.limits.max_tool_calls:
-                self.stop_retrieval("tool_calls")
-                break
-            if initial_reads >= self.limits.initial_max_reads:
-                self.limitations.append(
-                    "初始读取达到上限，剩余候选未读取；Agent可在额度内补查。"
-                )
-                self.trace.append(
-                    {
-                        "event": "initial_read_limit",
-                        "remaining_candidates_not_read": True,
-                    }
-                )
-                break
-            initial_reads += 1
-            call = ToolCall(
-                call_id=f"initial-{self.usage.tool_calls + 1}",
-                name="read_file",
-                arguments={"path": key[0], "start_line": start, "end_line": end}
-                | ({"repo_id": hit["repo_id"]}),
-            )
-            outcome = self.invoke(call)
-            self.initial_cursor = cursor + 1
-            if not outcome.ok:
-                if self.source_failure:
-                    if outcome.error.recoverable:
-                        self.observe(call, outcome)
-                    break
-                if outcome.error.code in TEXT_ERRORS and outcome.error.recoverable:
-                    self.observe(call, outcome)
-                    continue
-                if outcome.error.recoverable:
-                    self.observe(call, outcome)
-                    continue
-                raise StopExecution("FAILED", outcome.error.code)
-            block = outcome.result
-            if not block["truncated"] and block["end_line"] < end:
-                known_file_ends[identity] = block["end_line"]
-            self.observe(call, outcome)
+        read_initial_hits(
+            hits["items"], search_kind, strategy=self.query.policy.retrieval_strategy,
+            initial_cursor=self.initial_cursor, state=self.state, usage=self.usage,
+            limits=self.limits, trace=self.trace, limitations=self.limitations,
+            invoke=self.invoke, observe=self.observe, advance=self._advance_initial_cursor,
+            source_stopped=lambda: bool(self.source_failure), stop_retrieval=self.stop_retrieval,
+        )
         self.trace.append(
             {
                 "event": "evidence",
@@ -1049,11 +1026,11 @@ class Execution:
         if response.kind != "citation_patch":
             return self.accept_candidate(response.answer)
         evidence = self.answer_evidence
-        try:
-            patched = apply_citation_patch(self.repair_feedback, response.citation_patch, evidence)
-        except (ValueError, KeyError, TypeError) as error:
-            details = {"code": error.code, "citation_index": error.citation_index} if isinstance(error, PatchValidationError) else {"code": "citation_patch_invalid"}
-            return self.reject_patch(details)
+        patched, rejection = check_citation_patch(
+            response.citation_patch, self.repair_feedback, evidence,
+        )
+        if rejection is not None:
+            return self.reject_patch(rejection)
         self.pending_response = None
         if patched is None:
             self.trace.append({"event": "citation_patch_fallback", "reason": response.citation_patch.status})
@@ -1107,18 +1084,18 @@ class Execution:
         self.last_candidate_evidence = [e.model_copy(deep=True) for e in evidence]
         issues = self.publisher.validate_candidate(answer, evidence, self.state.evidence)
         if not issues:
-            if self.should_review(answer):
+            review_input = review_request(
+                answer, self.state, self.limits, self.usage, mode=self.mode,
+                supported=getattr(self.session.adapter, "content_review", False),
+                reason=self.finalization_reason, feedback=self.repair_feedback,
+            )
+            if review_input is not None:
                 self.state.semantic_review_done = True
-                risks = review_risks(answer, self.state, self.finalization_reason, self.repair_feedback)
                 self.evidence_manager.protect(c.evidence_id for c in answer.citations)
-                candidate = answer.model_dump()
-                candidate["citations"] = [{k: getattr(c, k) for k in ("evidence_id", "start_line", "end_line", "claim_ids")}
-                                          for c in answer.citations]
-                self.review_input = {"candidate_revision": candidate_revision(answer), "candidate": candidate,
-                                     "risks": risks, "review_is_advisory": True}
+                self.review_input = review_input
                 self.repair_feedback = None
                 self.repair_notice = ""
-                self.trace.append({"event": "content_review_triggered", "risks": risks,
+                self.trace.append({"event": "content_review_triggered", "risks": review_input["risks"],
                                    "thinking": getattr(self.session.adapter, "native_thinking", "default"),
                                    "output_limit": self.limits.content_review_output_tokens})
                 self.pending_response = None
@@ -1149,28 +1126,13 @@ class Execution:
         self.checkpoint("ready")
         return None
 
-    def should_review(self, answer):
-        return (self.mode == "agent" and self.limits.content_review_enabled
-                and getattr(self.session.adapter, "content_review", False)
-                and not self.state.semantic_review_done
-                and self.limits.max_model_requests - self.usage.model_requests >= 1
-                and bool(review_risks(answer, self.state, self.finalization_reason, self.repair_feedback)))
-
     def review_warning(self, reason, concerns=(), *, major=False):
         self.review_input = None
         self.pending_response = None
         self.repair_feedback = None
         self.trace.append({"event": "content_review_unresolved", "reason": reason,
                            "concerns": list(concerns), "major": major})
-        answer = self.last_candidate.model_copy(deep=True)
-        labels = {"review_unavailable": "本次未取得有效复核结果", "local_patch_rejected": "局部修改未通过核对，未应用该修改",
-                  "review_followup_budget": "补充调查额度已用尽", "review_evidence_unavailable": "尚缺关键证据，无法继续补充",
-                  "review_cannot_apply_locally": "问题超过本次局部修改范围", "stale_review_candidate": "复核针对的回答版本已变化",
-                  "review_interrupted_no_repeat": "复核中断，本次没有重复调用"}
-        answer.limitations.append("内容复核未完全解决，保留原回答：" + labels.get(reason.split(":", 1)[0], "仍有待核实问题"))
-        answer.limitations.extend(concerns)
-        if major:
-            answer.answer_status = "insufficient_evidence"
+        answer = answer_with_review_warning(self.last_candidate, reason, concerns, major=major)
         self.answer_evidence = self.last_candidate_evidence
         return self.finish(answer)
 
@@ -1194,10 +1156,7 @@ class Execution:
             self.review_input = None
             self.answer_evidence = sources
             return self.accept_candidate(revised)
-        if (review.verdict == "needs_evidence" and not self.finalization_reason
-                and self.limits.content_review_followup_models >= 2 and self.limits.content_review_followup_tools > 0
-                and self.limits.max_model_requests - self.usage.model_requests >= 2
-                and self.usage.tool_calls < self.limits.max_tool_calls):
+        if can_follow_up(review, self.finalization_reason, self.limits, self.usage):
             self.review_input = None
             self.state.review_followup_models_left = self.limits.content_review_followup_models
             self.state.review_followup_tools_left = self.limits.content_review_followup_tools

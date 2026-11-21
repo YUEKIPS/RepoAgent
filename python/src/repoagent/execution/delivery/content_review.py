@@ -5,7 +5,7 @@ import json
 import re
 
 from repoagent.execution.contracts import Answer, materialize_answer
-from repoagent.execution.publication import validate_citations
+from repoagent.execution.delivery.publication import validate_citations
 
 
 def candidate_revision(answer):

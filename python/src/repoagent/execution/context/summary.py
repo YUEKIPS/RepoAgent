@@ -47,3 +47,27 @@ class SummaryService:
             source_turn_ids=material["source_turn_ids"], source_hash=source_hash,
             generation_id=generation_id, result=result,
         )
+
+
+def apply_context_summary(result, *, pending, query, history, task_id, session, registry_fingerprint):
+    """Apply known summary material while the executor owns checkpoint transitions."""
+    material = pending["material"]
+    if pending["kind"] == "history":
+        record = SummaryService().validate_result(result, query, material, session.generation_id)
+        history.apply_summary(record, task_id)
+        context = query.conversation
+        context.summary = record
+        context.turns = [turn for turn in context.turns if turn.turn_id not in record.source_turn_ids]
+        context.omitted_turns = len(record.source_turn_ids)
+        return record, {
+            "event": "history_summarized",
+            "summary_revision": record.revision,
+            "source_turn_ids": record.source_turn_ids,
+        }
+    if pending["kind"] != "steps" or not result.items or any(
+        set(item.turn_ids) != {task_id} for item in result.items
+    ):
+        raise ModelServiceError(code="invalid_summary_provenance")
+    ids = history.apply_step_memory(task_id, material, result, session.generation_id, registry_fingerprint)
+    session.rebase_continuation(ids)
+    return None, {"event": "steps_summarized", "source_event_seqs": material["source_event_seqs"]}

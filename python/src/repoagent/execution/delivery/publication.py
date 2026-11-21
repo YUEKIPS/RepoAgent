@@ -10,7 +10,7 @@ from repoagent.execution.contracts import (
     materialize_answer,
     origin_fields,
 )
-from repoagent.execution.notices import build_notices, stop_notice
+from repoagent.execution.delivery.notices import build_notices, stop_notice
 
 
 class CitationValidationError(ValueError):
@@ -89,7 +89,7 @@ def citations_with_context(answer: Answer, evidence: list[Evidence]) -> Answer:
 
 class AnswerPublisher:
     def validate_candidate(self, answer, evidence, all_evidence=()):
-        from repoagent.execution.repair import citation_issues
+        from repoagent.execution.delivery.repair import citation_issues
         return citation_issues(answer, evidence, all_evidence)
 
     def publish(

@@ -5,11 +5,11 @@ import re
 import sqlite3
 from contextlib import contextmanager
 
+from repoagent.execution.context.history import HistoryPolicy
 from repoagent.execution.contracts import (
     Workspace,
 )
 from repoagent.execution.conversation_session import SessionEventStore
-from repoagent.execution.history import HistoryPolicy
 from repoagent.storage import guard_database
 from repoagent.web.errors import ServiceError
 

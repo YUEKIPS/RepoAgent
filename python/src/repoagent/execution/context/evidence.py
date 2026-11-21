@@ -4,6 +4,7 @@ import re
 
 from repoagent.execution.contracts import Evidence
 from repoagent.execution.control import estimate
+from repoagent.execution.preparation import read_window as read_window
 from repoagent.tools.store import source_lines
 
 
@@ -47,18 +48,6 @@ def uncovered_segments(
 def ordered_hits(hits: list[dict], strategy: str) -> list[dict]:
     """保持当前检索命中顺序。"""
     return hits
-
-
-def read_window(hit: dict, kind: str, strategy: str) -> tuple[int, int]:
-    """当前策略保持60行窗口，长方法由工具续读。"""
-    start = max(1, hit["start_line"] - 3)
-    end = min(hit.get("end_line", start) + 3, start + 59)
-    if kind == "path":
-        return start, start + 59
-    if "enclosing_type_start_line" in hit:
-        start = max(1, hit["enclosing_type_start_line"] - 3, end - 59)
-        end = min(hit["enclosing_type_end_line"] + 3, start + 59)
-    return start, end
 
 
 class EvidenceManager:

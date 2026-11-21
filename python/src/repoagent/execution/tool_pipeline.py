@@ -3,7 +3,7 @@
 from repoagent.execution.contracts import Observation, ToolCall, ToolOutcome
 from repoagent.execution.control import StopExecution
 from repoagent.repositories.text import TEXT_ERRORS
-from repoagent.tools.registry import compact_navigation
+from repoagent.tools.projection import compact_navigation
 
 
 class ToolPipeline:

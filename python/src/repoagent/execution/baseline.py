@@ -10,10 +10,8 @@ from pathlib import Path
 from repoagent.execution.contracts import Query, Result
 from repoagent.execution.limits import Limits
 from repoagent.execution.model_session import ModelSession
-from repoagent.execution.runtime import (
-    Execution,
-    PreparedContext,
-)
+from repoagent.execution.preparation import PreparedContext
+from repoagent.execution.task import run_task
 from repoagent.models.base import ProviderAdapter
 
 
@@ -34,13 +32,7 @@ def run_baseline(
     参数与run_agent一致；prepared用于配对复用初始规划/证据。
     区别仅为baseline模式：准备完成后一次作答，收到追加工具请求会被拒绝。
     """
-    options = dict(execution_options or {})
-    if saved:
-        options["task_id"] = saved["task_id"]
-    execution = Execution(
+    return run_task(
         snapshot, query, model, limits, cancelled, clock, "baseline", on_progress,
-        **options,
+        prepared=prepared, execution_options=execution_options, saved=saved,
     )
-    if saved:
-        execution.restore(saved)
-    return execution.run(prepared)

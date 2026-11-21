@@ -2,7 +2,6 @@
 
 import time
 
-from repoagent.execution.contracts import Query
 from repoagent.execution.runtime import PROTOCOL_VERSION
 from repoagent.execution.usage_store import UsageStore
 from repoagent.models.base import configuration_id
@@ -10,11 +9,19 @@ from repoagent.models.factory import create_adapter
 
 
 class RecoveryCoordinator:
-    def __init__(self, service):
-        self.service = service
+    def __init__(
+        self, checkpoints, conversations, verify_workspace, *,
+        extensions_fingerprint, model_snapshot, usage_path,
+    ):
+        self.checkpoints = checkpoints
+        self.conversations = conversations
+        self.verify_workspace = verify_workspace
+        self.extensions_fingerprint = extensions_fingerprint
+        self.model_snapshot = model_snapshot
+        self.usage_path = usage_path
 
     def inspect(self, job):
-        saved = self.service.checkpoints.load(job["id"])
+        saved = self.checkpoints.load(job["id"])
         if not saved:
             return None, "checkpoint_unavailable"
         if job.get("cancel_requested"):
@@ -29,21 +36,21 @@ class RecoveryCoordinator:
             return None, "checkpoint_execution_failed"
         if saved["phase"] == "context_compacting" and (not saved.get("pressure_pending") or (saved.get("pending_response") or {}).get("kind") != "summary"):
             return None, "context_compaction_uncommitted"
-        if saved.get("extensions_fingerprint") != self.service.extensions_fingerprint:
+        if saved.get("extensions_fingerprint") != self.extensions_fingerprint:
             return None, "checkpoint_extensions_mismatch"
         if saved["phase"] == "tool_inflight":
             return None, "source_operation_unsettled"
-        session = self.service.conversations.get_session(job["session_id"])
+        session = self.conversations.get_session(job["session_id"])
         if session["head"] != job["id"]:
             return None, "stale_session_parent"
-        self.service._bound_manifest(session)
+        self.verify_workspace(session)
         if saved["query"]["workspace"] != session["workspace"]:
             return None, "workspace_version_conflict"
         if not job["simulated"]:
-            adapter = create_adapter(self.service.model_snapshot.create_config()).with_native_thinking(job["policy"]["native_thinking"])
+            adapter = create_adapter(self.model_snapshot.create_config()).with_native_thinking(job["policy"]["native_thinking"])
             if configuration_id(adapter.configuration) != saved["session"]["generation_id"]:
                 return None, "checkpoint_configuration_mismatch"
-            ledger = UsageStore(self.service.usage_path)
+            ledger = UsageStore(self.usage_path)
             ledger.release_reserved_task(saved["task_id"])
             usage = ledger.summary(saved["task_id"])
             if usage["unresolved_requests"] or usage["halted"] or saved["session"]["halted"]:
@@ -52,16 +59,12 @@ class RecoveryCoordinator:
                 return None, "checkpoint_response_unavailable"
         return saved, None
 
-    def resume_eligible(self):
-        with self.service.conversations.connect() as db:
+    def resume_eligible(self, resume):
+        with self.conversations.connect() as db:
             rows = db.execute("SELECT id FROM turns WHERE json_extract(job,'$.state')='interrupted' ORDER BY sequence").fetchall()
         for (identifier,) in rows:
             try:
-                self.service.resume(identifier)
-                return
+                if resume(identifier)["state"] != "interrupted":
+                    return
             except Exception:
                 continue
-
-
-def restored_query(saved):
-    return Query.model_validate(saved["query"])

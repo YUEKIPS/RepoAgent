@@ -8,8 +8,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 from repoagent.execution.contracts import Query, Result
+from repoagent.execution.limits import Limits
 from repoagent.execution.model_session import ModelSession
-from repoagent.execution.runtime import Execution, Limits, PreparedContext
+from repoagent.execution.preparation import PreparedContext
+from repoagent.execution.task import run_task
 from repoagent.models.base import ProviderAdapter
 
 
@@ -31,13 +33,7 @@ def run_agent(
     cancelled/clock可注入以测试取消和超时；prepared可复用同配置的初始准备。
     构造阶段输入或快照错误直接抛出；进入run后可预期执行错误转为失败结果。
     """
-    options = dict(execution_options or {})
-    if saved:
-        options["task_id"] = saved["task_id"]
-    execution = Execution(
+    return run_task(
         snapshot, query, model, limits, cancelled, clock, "agent", on_progress,
-        **options,
+        prepared=prepared, execution_options=execution_options, saved=saved,
     )
-    if saved:
-        execution.restore(saved)
-    return execution.run(prepared)

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from repoagent.execution.prompt_spec import PROTOCOL_CORRECTION, STABLE_SYSTEM
 from repoagent.models.base import ModelBudgetError
+from repoagent.models.response_json import encode_json as encoded
 
 
 @dataclass(frozen=True)
@@ -34,12 +35,6 @@ class CachePolicy:
         if any(n not in cls.__dataclass_fields__ for n in names):
             raise ValueError("Unknown cache experiment policy")
         return cls(**{n: True for n in names})
-
-
-
-
-def encoded(obj):
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
 def native_messages(continuations, observations, *, allow_unexecuted=False):

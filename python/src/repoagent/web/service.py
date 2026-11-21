@@ -11,9 +11,13 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from repoagent import __version__
+from repoagent.application.recovery import RecoveryCoordinator
+from repoagent.application.runner import TaskRunner
+from repoagent.application.task_lifecycle import TaskLifecycle
 from repoagent.execution.agent import run_agent
 from repoagent.execution.baseline import run_baseline
 from repoagent.execution.checkpoints import CheckpointStore
+from repoagent.execution.context.history import HistoryPolicy
 from repoagent.execution.contracts import (
     ExecutionPolicy,
     Query,
@@ -21,7 +25,6 @@ from repoagent.execution.contracts import (
     Workspace,
     origin_fields,
 )
-from repoagent.execution.history import HistoryPolicy
 from repoagent.execution.limits import Limits
 from repoagent.execution.model_session import ModelSession
 from repoagent.execution.usage_store import UsageStore
@@ -42,9 +45,7 @@ from repoagent.tools.store import SnapshotTools, read_text_block
 from repoagent.web.conversations import ConversationStore, valid_id
 from repoagent.web.errors import ServiceError
 from repoagent.web.library import LibraryStore, logical_key
-from repoagent.web.recovery import RecoveryCoordinator
 from repoagent.web.repositories import RepositoryManager, alias
-from repoagent.web.runner import RunOutcome, TaskRunner
 from repoagent.web.streams import StreamBroker
 
 
@@ -125,11 +126,6 @@ class ChatService:
         )
         self.secrets = tuple(s for s in secrets if s)
         self.lock = threading.Lock()
-        self.jobs = {}
-        self.inputs = {}
-        self.events = {}
-        self.active = None
-        self.storage_fault = False
         self.model_sources = (["mock"] if mock_responses is not None else []) + (
             ["live"] if model_snapshot is not None else []
         )
@@ -154,6 +150,10 @@ class ChatService:
         self.repository_store = repository_store or RepositoryStore(
             self.output_dir / "repositories"
         )
+        self.tasks = TaskLifecycle(
+            self.lock, self.conversations, self.checkpoints, self.repository_store,
+            self.streams, clean=self._clean, export=self._export_task,
+        )
         self.github_client = github_client or GitHubClient()
         self.repository_manager = RepositoryManager(
             self.repository_store,
@@ -167,9 +167,25 @@ class ChatService:
         )
         self.repository_manager.on_result = self._organize_repository_result
         self._protect_pool_versions()
-        self.recovery = RecoveryCoordinator(self)
+        self.recovery = RecoveryCoordinator(
+            self.checkpoints, self.conversations, self._bound_manifest,
+            extensions_fingerprint=self.extensions_fingerprint,
+            model_snapshot=self.model_snapshot, usage_path=self.usage_path,
+        )
         if self.checkpoints.auto_resume():
-            self.recovery.resume_eligible()
+            self.recovery.resume_eligible(self.resume)
+
+    @property
+    def jobs(self):
+        return self.tasks.jobs
+
+    @property
+    def events(self):
+        return self.tasks.events
+
+    @property
+    def active(self):
+        return self.tasks.active
 
     def _protect_pool_versions(self):
         with self.conversations.connect() as db:
@@ -458,7 +474,7 @@ class ChatService:
                 or (self.output_dir / f"{command.request_id}.json").exists()
             ):
                 raise ServiceError("saved_request_id_already_exists", 409)
-            if self.storage_fault:
+            if self.tasks.storage_fault:
                 raise ServiceError("conversation_storage_requires_review", 409)
             if self.active:
                 raise ServiceError("task_already_running", 409)
@@ -551,22 +567,14 @@ class ChatService:
                 }
             # SQLite事务先持久化完整任务身份/上下文并推进父轮次，再启动工作线程。
             self.conversations.accept(canonical, job, context)
-            self.jobs[job["id"]] = job
-            self.inputs[job["id"]] = canonical
-            event = self.events[job["id"]] = threading.Event()
-            self.active = job["id"]
-            try:
-                threading.Thread(
-                    target=self._execute, args=(command, query, event), daemon=True
-                ).start()
-            except Exception:
-                job.update(state="finished", error={"code": "task_start_failed"})
-                job = self._persist_terminal(job)
-                self.jobs[job["id"]] = job
-                self.active = None
+            job = self.tasks.start(
+                job, lambda cancelled, progress: self._run_task(command, query, cancelled, progress),
+            )
             return self._clean(deepcopy(job))
 
-    def _execute(self, command, query, event, saved=None):
+    def _run_task(self, command, query, cancelled, progress, saved=None):
+        from repoagent.tools.extensions import ExtensionBundle
+
         runner = TaskRunner(
             self.model_snapshot,
             self.usage_path,
@@ -575,28 +583,23 @@ class ChatService:
             {"agent": run_agent, "baseline": run_baseline},
             adapter_factory=create_adapter,
         )
-
-        def progress(event_data):
-            with self.lock:
-                projection = self.conversations.record_progress(
-                    command.request_id, event_data
-                )
-                self.jobs[command.request_id]["progress"] = projection
-            self.streams.publish(command.request_id, event_data)
-
-        bundle = None
+        bundle = ExtensionBundle(self.extensions_config)
         try:
-            from repoagent.tools.extensions import ExtensionBundle
-            bundle = ExtensionBundle(self.extensions_config)
             if bundle.fingerprint != self.extensions_fingerprint:
                 raise ValueError("Extension catalog changed since server startup")
             job = self.jobs[command.request_id]
             with self.conversations.connect() as db:
-                cached = db.execute("SELECT revision FROM conversation_summaries WHERE session_id=?", (command.session_id,)).fetchone()
-            base = [cached[0] if cached else None]
+                cached = db.execute(
+                    "SELECT revision FROM conversation_summaries WHERE session_id=?",
+                    (command.session_id,),
+                ).fetchone()
+            revision = cached[0] if cached else None
+
             def save_summary(summary):
-                self.conversations.save_summary_if_current(summary, command.request_id, base[0])
-                base[0] = summary.revision
+                nonlocal revision
+                self.conversations.save_summary_if_current(summary, command.request_id, revision)
+                revision = summary.revision
+
             options = dict(
                 task_id=command.request_id,
                 checkpoint_sink=lambda body: self.checkpoints.save_boundary(command.request_id, body),
@@ -606,26 +609,11 @@ class ChatService:
                 summary_sink=save_summary,
                 deadline_at=job["deadline_at"],
             )
-            outcome = runner.execute(command, query, event.is_set, progress, execution_options=options, saved=saved)
-        except Exception:
-            outcome = RunOutcome(None, {"code": "history_or_execution_setup_failed"})
+            return runner.execute(
+                command, query, cancelled, progress, execution_options=options, saved=saved,
+            )
         finally:
-            if bundle:
-                bundle.close()
-        result, error = outcome.result, outcome.error
-        with self.lock:
-            job = self.jobs[command.request_id]
-            job.update(state="finished", result=result, error=error)
-            self.jobs[command.request_id] = self._persist_terminal(job)
-            committed = self.jobs[command.request_id]
-            if committed.get("publication_status") == "committed":
-                self.streams.publish(command.request_id, {"event": "published" if (committed.get("result") or {}).get("execution_status") == "SUCCEEDED" else "failed", "state": "finished"})
-            self.active = None
-            # 会话历史分页读库，终态不常驻内存。
-            if command.session_id and not self.storage_fault:
-                self.jobs.pop(command.request_id, None)
-                self.inputs.pop(command.request_id, None)
-                self.events.pop(command.request_id, None)
+            bundle.close()
 
     def runtime_settings(self, payload):
         if set(payload) != {"auto_resume"} or type(payload["auto_resume"]) is not bool:
@@ -638,7 +626,7 @@ class ChatService:
     def resume(self, identifier):
         valid_id(identifier)
         with self.lock:
-            if self.active or self.storage_fault:
+            if self.active or self.tasks.storage_fault:
                 raise ServiceError("task_already_running", 409)
             job = self.conversations.get(identifier)
             if not job or job["state"] != "interrupted":
@@ -654,63 +642,23 @@ class ChatService:
             command = ChatInput.model_validate_json(raw)
             query = Query.model_validate(saved["query"])
             self.library.session(command.session_id, writable=True)
-            job.update(state="running", error=None)
-            self.conversations.save(job)
-            self.jobs[identifier] = job
-            event = self.events[identifier] = threading.Event()
-            self.active = identifier
-            threading.Thread(target=self._execute, args=(command, query, event, saved), daemon=True).start()
+            job = self.tasks.start(
+                job,
+                lambda cancelled, progress: self._run_task(command, query, cancelled, progress, saved),
+                resume=True,
+            )
             return self._clean(deepcopy(job))
 
-    def _persist_terminal(self, job):
-        """调用方持锁；启动失败与执行完成共用终态落盘，不回显底层异常。"""
-        if not job["simulated"]:
-            snapshot = self.model_snapshot
-            job["configuration"] = {
-                "source_sha256": snapshot.source_sha256,
-                "resolved_sha256": snapshot.resolved_sha256,
-                "resolved": json.loads(snapshot.resolved_json),
-            }
-        job = self._clean(job)
-        self.repository_store.publication_pending(job["id"])
-        job["artifact_saved"] = False
-        job["publication_status"] = "committed"
-        # The database is authoritative. A candidate must not become a formal
-        # answer through polling or JSON export before this transaction succeeds.
-        try:
-            self.checkpoints.commit_terminal(job)
-        except Exception:
-            self.storage_fault = True
-            job["publication_status"] = "uncommitted"
-            job["uncommitted_result"] = job.get("result")
-            job["result"] = None
-            job["error"] = {"code": "conversation_storage_requires_review"}
-            job["artifact_error"] = "conversation_storage_requires_review"
-            return job
-        try:
-            self._outside_snapshots(self.output_dir)
-            target = self.output_dir / f"{job['id']}.json"
-            if target.is_symlink():
-                raise ValueError("Refuse artifact symlink")
-            job["artifact_saved"] = True
-            temporary = target.with_suffix(".tmp")
-            with temporary.open("x", encoding="utf-8") as out:
-                json.dump(job, out, ensure_ascii=False, indent=2)
-                out.write("\n")
-            temporary.replace(target)
-        except Exception:
-            job["artifact_saved"] = False
-            job["artifact_error"] = "artifact_write_failed_export_from_browser"
-        try:
-            self.conversations.save(job)  # Export metadata; never reopens generation.
-        except Exception:
-            self.storage_fault = True
-            job["artifact_error"] = "conversation_storage_requires_review"
-        self.repository_store.finish_run(
-            job["id"],
-            published=bool((job.get("result") or {}).get("execution_status") == "SUCCEEDED"),
-        )
-        return job
+    def _export_task(self, job):
+        self._outside_snapshots(self.output_dir)
+        target = self.output_dir / f"{job['id']}.json"
+        if target.is_symlink():
+            raise ValueError("Refuse artifact symlink")
+        temporary = target.with_suffix(".tmp")
+        with temporary.open("x", encoding="utf-8") as out:
+            json.dump(job, out, ensure_ascii=False, indent=2)
+            out.write("\n")
+        temporary.replace(target)
 
     def get(self, task_id):
         valid_id(task_id)
@@ -741,14 +689,7 @@ class ChatService:
             return self._clean([deepcopy(job) for job in self.jobs.values()])
 
     def cancel(self, task_id):
-        with self.lock:
-            if task_id not in self.jobs:
-                # 已持久化终态不再执行，幂等取消由get返回。
-                pass
-            elif self.jobs[task_id]["state"] == "running":
-                self.events[task_id].set()
-                self.jobs[task_id]["cancel_requested"] = True
-                self.conversations.save(self.jobs[task_id])
+        self.tasks.cancel(task_id)
         return self.get(task_id)
 
     def source(self, task_id, citation_index, start=None, column=0, context=False):

@@ -6,9 +6,9 @@ This policy has no authority to send requests or alter the cumulative source sta
 from dataclasses import dataclass
 
 from repoagent.execution.contracts import Answer, ModelRequest
+from repoagent.execution.delivery.repair import is_citation_patch, patch_constraints
 from repoagent.execution.prompts import request_instruction
-from repoagent.execution.repair import is_citation_patch, patch_constraints
-from repoagent.tools.protocol import tool_schemas
+from repoagent.tools.schema import tool_schemas
 
 
 @dataclass(frozen=True)
